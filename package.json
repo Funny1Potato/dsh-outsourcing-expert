@@ -1,0 +1,34 @@
+{
+  "name": "dsh-outsourcing-expert",
+  "version": "1.0.0",
+  "description": "DeepSeek Harness agent presets whose leader does no work itself: every non-management tool call is denied at the harness boundary and the task goes to a subagent instead, after a one-time research pass over the available subagent models and a per-task model choice (a second preset deliberately picks weaker models for harder tasks).",
+  "license": "MIT",
+  "type": "module",
+  "main": "src/index.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Funny1Potato/dsh-outsourcing-expert.git"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "agent-preset",
+    "subagent",
+    "delegation"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "files": [
+    "src/index.js",
+    "cordis.patch.yml",
+    "README.md"
+  ]
+}
