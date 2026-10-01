@@ -5,7 +5,7 @@
 | preset | id | 选人规则 |
 | --- | --- | --- |
 | **外包高手** | `outsourcing-expert` | 能力对齐：简单 →轻量快速，中等 →均衡，困难 →代码专精或强推理，极难 →旗舰强推理 |
-| **外包高手（反向用人）** | `outsourcing-expert-reverse` | 故意反着来：任务越难越用**弱**模型，越简单越用**强**模型 |
+| **外包高手（独具慧眼）** | `outsourcing-expert-reverse` | 故意反着来：任务越难越用**弱**模型，越简单越用**强**模型 |
 
 两个 preset 只差插件行配置里的 `reverseHiring`；**没有运行时开关**，选哪个就是哪个。
 
@@ -95,7 +95,7 @@ dsh plugin --profile <profile> add github:Funny1Potato/dsh-outsourcing-expert
 dsh plugin --profile <profile> add link:<本目录绝对路径>
 ```
 
-Desktop 端的 profile 由应用独占管理，装插件走界面（**插件 → 添加插件**，填 `github:Funny1Potato/dsh-outsourcing-expert`、本地目录绝对路径或 `link:<路径>`）。装完后**新建会话**，在 preset 选择里选「外包高手」或「外包高手（反向用人）」。
+Desktop 端的 profile 由应用独占管理，装插件走界面（**插件 → 添加插件**，填 `github:Funny1Potato/dsh-outsourcing-expert`、本地目录绝对路径或 `link:<路径>`）。装完后**新建会话**，在 preset 选择里选「外包高手」或「外包高手（独具慧眼）」。
 
 ## 文件
 

@@ -8,7 +8,7 @@
 #
 # 两个 preset 的差别只有一个字段：
 #   1. 「外包高手」            → config.reverseHiring: false，按能力对齐选人（正常）
-#   2. 「外包高手（反向用人）」 → config.reverseHiring: true，故意反着选（越难越用弱模型）
+#   2. 「外包高手（独具慧眼）」 → config.reverseHiring: true，故意反着选（越难越用弱模型）
 #
 # ⚠ preset 的 `config.id` **一旦发布就不要再改**：id 会被**会话头、界面设置、客户端缓存**
 #   长期引用，改它会让已有会话与已保存的选择全部指向一个不存在的 preset（报
@@ -196,14 +196,14 @@
               # 关掉它就退回「每个会话各自侦察一次」的老行为。
               capabilityCache: true
     # ====================================================================
-    # preset 2：「外包高手（反向用人）」（越难越用弱模型）
+    # preset 2：「外包高手（独具慧眼）」（越难越用弱模型）
     # 花名册与 preset 1 逐行相同，只有最后那行插件的 reverseHiring 不同。
     # ====================================================================
     - id: preset-outsourcing-expert-reverse
       name: '@deepseek-ai/dsh-agent-preset'
       config:
         id: outsourcing-expert-reverse
-        name: 外包高手（反向用人）
+        name: 外包高手（独具慧眼）
         description: 同上，但故意反着挑人：任务越难越用弱模型，越简单越用强模型。
         order: 6
         plugins:
