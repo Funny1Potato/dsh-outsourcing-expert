@@ -9,10 +9,6 @@
 
 两个 preset 只差插件行配置里的 `reverseHiring`；**没有运行时开关**，选哪个就是哪个。
 
-> **改名历史与 id 冻结**：早先包名与 preset id 都叫 `incompetent-leader`（显示名一直是「外包高手」）；发布前统一改成了 `outsourcing-expert` / `dsh-outsourcing-expert`。**这之后 id 就定死了**——preset id 会被会话头、界面设置、客户端缓存长期引用，再改会让已有会话与已保存的选择指向不存在的 preset（`agent-preset/not-found`）。以后想换显示名，只改 `name` / `description`。
->
-> 用旧 id 建过的会话需要**新建会话重新选 preset**。
-
 **只在使用这两个 preset 的会话里生效**：preset 的 `plugins` 挂在该 preset 自己的 scope 下，scope 化的拦截器与提示段由宿主按会话过滤；别的 preset（standard、ptc、`leader`…）的会话完全看不到。
 
 ## English summary
