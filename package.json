@@ -1,6 +1,6 @@
 {
   "name": "dsh-outsourcing-expert",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "DeepSeek Harness agent presets whose leader does no work itself: every non-management tool call is denied at the harness boundary and the task goes to a subagent instead, after a one-time research pass over the available subagent models and a per-task model choice (a second preset deliberately picks weaker models for harder tasks).",
   "license": "MIT",
   "type": "module",

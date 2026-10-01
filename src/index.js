@@ -15,6 +15,14 @@
  * 用人两步走：第一轮派一个子智能体**联网调研**「可选模型各自擅长什么」，拿到能力表
  * （只自己用、不展示给用户）之后，每一件活再按能力表 + 任务难度决定派给谁。
  *
+ * **能力表缓存**：调研一次很贵（要联网搜一遍），而结果对这台机器上的每个会话都一样，
+ * 所以侦察结果会由本插件自动写到 `<DSH_HOME>/outsourcing-expert/models.md`，之后所有会话
+ * 直接把表内联进提示段用，不再侦察。缓存存在时：
+ *   - 提示段换成「直接用表」的版本（附上表正文）；
+ *   - 代码里的「先查名册」「第一条必须前台」两道门随之取消——它们只为保证侦察真的发生。
+ * 表**只在空的时候写**，永不自动覆盖：想换新表就删文件或跑 `/outsourcing-models-clear`
+ * （要连当前会话一起重来，用 `/outsourcing-models-init`）。
+ *
  * 与宿主 dsh 0.2.0-rc.2 的契约，逐条按源码核过：
  *
  *   - 插件模块必须具名导出 `name` / `inject` / `apply(ctx, config)`。配置由 apply
@@ -22,7 +30,13 @@
  *     永远停在 PENDING（服务到不了位），表现就是「装了但完全没生效」。
  *   - 入口模块必须是 ESM：package.json 的 `"type": "module"`（或入口用 `.mjs`）。缺了它，
  *     Node 按 CommonJS 解析 `export` 会直接 SyntaxError，该行既不挂载、也不会大声报错。
- *   - `systemPrompt.section({ name, order, text })` —— 字段名是 `text`，不是 `content`。
+ *   - `systemPrompt.section({ name, order, text })` —— 字段名是 `text`，不是 `content`；
+ *     `text` 是函数时**每次装配都会重新求值**（所以缓存能随文件变化），但它拿到的
+ *     `AssembleContext` 只有 `{ scope?, signal? }`：**没有会话、没有工作区**。这就是缓存
+ *     只能是机器级全局一份的原因（模型能力本来也与工作区无关）。
+ *   - 该段必须标 `interpolate: false`：宿主对 `{{变量}}` 是严格的，源码注释原话是
+ *     *"Malformed, unknown, or undefined references in other sections throw"*——缓存正文是
+ *     模型写的，里面出现 `{{model}}` 这类字面量就会**打断整轮装配**。
  *   - `tools/pre-execute` 是 waterfall：`(exec, next)` → `{ kind: 'deny', reason }`。
  *     它只能 allow / deny / cancel / ask；harness 明确排除「改写参数」（参数此刻已经
  *     记入日志并展示给用户），所以这里**只能拒绝**，不能替领导把模型改掉。
@@ -34,11 +48,16 @@
  * 同进程里其它会话以及宿主自己的调用。
  */
 
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join, resolve } from 'node:path'
+
 export const name = 'outsourcing-expert'
 
 /**
  * 必需服务。只列真正必需的两个：`tools`（拦截）与 `systemPrompt`（注入纪律段）。
  * 列了不存在的服务会让插件在那种组合里一直等下去、永不激活。
+ * `commands` 与 `sessionTitle` 是可有可无的，走 `ctx.get(...)` 取。
  */
 export const inject = ['tools', 'systemPrompt']
 
@@ -79,6 +98,23 @@ const DIFFICULTY_BANDS = ['简单', '中等', '困难', '极难']
 
 /** 委派工具：下面的「顺序纪律」只管这两个。 */
 const DELEGATION_TOOLS = new Set(['subagent', 'subagent_fork'])
+
+/** 名册工具：缓存为空时那道「先查名册再委派」的门靠它判定。 */
+const ROSTER_TOOL = 'list_subagent_models'
+
+/** 能力表缓存：目录名、文件名、首行元信息标记。 */
+const CACHE_DIR_NAME = 'outsourcing-expert'
+const CACHE_FILENAME = 'models.md'
+const CACHE_MARKER = 'dsh-outsourcing-expert'
+
+/** 缓存正文上限（字符）。它会被内联进**每次请求**的系统提示，所以必须封顶。 */
+const MAX_TABLE_CHARS = 6000
+
+/**
+ * 能力档位词。用来判断一段侦察结果「像不像一张能力表」——不像就不写进缓存，
+ * 宁缺勿脏：写坏了会污染之后所有会话的提示段。
+ */
+const TIER_WORDS = ['轻量快速', '均衡', '代码专精', '旗舰强推理', '多模态']
 
 /**
  * 这个工具调用是不是来自「下属」。会话头是权威判据：`origin === 'subagent'` 是
@@ -150,57 +186,192 @@ function composeChildTitle(route, task) {
   return task === undefined ? route : `${route} · ${task}`
 }
 
+// --- 能力表缓存：路径解析、读写、体检 ---------------------------------------
+
+/** 展开 `~` / `~/` / `~\`（与宿主 `expandHomePath` 同规则）。 */
+function expandHome(value) {
+  if (value === '~') return homedir()
+  if (value.startsWith('~/') || value.startsWith('~\\')) return join(homedir(), value.slice(2))
+  return value
+}
+
 /**
- * 纪律段正文。`text` 是函数，每次装配重新拼——白名单与升级规则跟着配置走。
+ * 解析缓存目录。配置项 `storeDir` 就是「放着 models.md 的那个目录」，原样使用；
+ * 不配置时按宿主 `@deepseek-ai/dsh-home-paths` 的 `resolveDshHome` 优先级取
+ * `$DSH_HOME`（空白视为未设）→ `~/.dsh`，再拼 `outsourcing-expert`。
+ * 这里内联实现是为了不给插件引入运行期依赖（顺带避开 peer 依赖版本范围那套坑）。
+ * @param {unknown} configured - 配置项 `storeDir`
+ * @returns {string} 绝对路径（不创建）
+ */
+function resolveStoreDir(configured) {
+  if (typeof configured === 'string' && configured.trim() !== '') {
+    return resolve(expandHome(configured.trim()))
+  }
+  const fromEnv = process.env.DSH_HOME
+  const home = typeof fromEnv === 'string' && fromEnv.trim() !== '' ? fromEnv : join(homedir(), '.dsh')
+  return resolve(expandHome(home), CACHE_DIR_NAME)
+}
+
+/** 按码点安全截断（避免把代理对切成半个字）。 */
+function clampChars(text, max) {
+  const chars = [...text]
+  if (chars.length <= max) return text
+  return `${chars.slice(0, max).join('')}\n…（本表超出 ${max} 字符上限，已截断）`
+}
+
+/** 取结果里的纯文本（委派结果正文优先，前台委派的结构化 `value.output` 兜底）。 */
+function resultText(result) {
+  const blocks = Array.isArray(result?.content) ? result.content : []
+  const text = blocks
+    .filter(block => block?.type === 'text' && typeof block.text === 'string')
+    .map(block => block.text)
+    .join('\n')
+    .trim()
+  if (text !== '') return text
+  const output = result?.value?.output
+  return typeof output === 'string' ? output.trim() : ''
+}
+
+/**
+ * 这段文字像不像一张能力表：至少两行带 `provider/model` 形状，并且出现能力档位词。
+ * 两道都要过——否则它更可能是一次普通干活的结论，写进缓存会污染所有后续会话。
+ */
+function looksLikeCapabilityTable(text) {
+  const lines = text.split(/\r?\n/).filter(line => line.trim() !== '')
+  const modelLines = lines.filter(line => /[A-Za-z0-9._-]+\s*\/\s*[A-Za-z0-9._-]+/.test(line)).length
+  return modelLines >= 2 && TIER_WORDS.some(word => text.includes(word))
+}
+
+/** 解析首行的元信息注释；手写的文件（没有这一行）返回 undefined。 */
+function parseCacheMeta(head) {
+  const match = new RegExp(`^<!--\\s*${CACHE_MARKER}\\s*(\\{.*\\})\\s*-->$`).exec(head.trim())
+  if (match === null) return undefined
+  try {
+    const parsed = JSON.parse(match[1])
+    return typeof parsed === 'object' && parsed !== null ? parsed : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 建一个能力表缓存读写器。文件格式：首行是元信息注释，其余是能力表正文——
+ * 首行缺失（手工写的文件）时整个文件都算正文。
+ * @param {string} dir - 缓存目录
+ */
+function createStore(dir) {
+  const file = join(dir, CACHE_FILENAME)
+  return {
+    file,
+    /**
+     * 读出缓存；文件不存在、读不了、或正文为空都返回 undefined（等价于「没有缓存」）。
+     * @returns {{ body: string, updatedAt?: string, source?: string } | undefined}
+     */
+    read() {
+      let raw
+      try {
+        raw = readFileSync(file, 'utf8')
+      } catch {
+        return undefined
+      }
+      const newline = raw.indexOf('\n')
+      const head = newline === -1 ? raw : raw.slice(0, newline)
+      const meta = parseCacheMeta(head)
+      const body = (meta === undefined ? raw : newline === -1 ? '' : raw.slice(newline + 1)).trim()
+      if (body === '') return undefined
+      return {
+        body,
+        ...typeof meta?.updatedAt === 'string' ? { updatedAt: meta.updatedAt } : {},
+        ...typeof meta?.source === 'string' ? { source: meta.source } : {},
+      }
+    },
+    /**
+     * 写入缓存（先写 `.tmp` 再改名，避免半截文件被读到）。
+     * @param {string} body - 能力表正文
+     * @param {string} [source] - 供人看的来源说明
+     */
+    write(body, source) {
+      const text = clampChars(body.trim(), MAX_TABLE_CHARS)
+      const meta = JSON.stringify({
+        updatedAt: new Date().toISOString(),
+        ...source === undefined ? {} : { source },
+      })
+      mkdirSync(dir, { recursive: true })
+      const temp = `${file}.tmp`
+      writeFileSync(temp, `<!-- ${CACHE_MARKER} ${meta} -->\n${text}\n`, 'utf8')
+      renameSync(temp, file)
+      return { body: text, updatedAt: new Date().toISOString() }
+    },
+    /** 删掉缓存文件；不存在时静默成功。 */
+    clear() {
+      rmSync(file, { force: true })
+    },
+  }
+}
+
+/** 把缓存时间压成一天粒度，只用于提示段里那句「侦察时间：…」。 */
+function formatCacheDate(cache) {
+  const parsed = Date.parse(cache?.updatedAt ?? '')
+  return Number.isNaN(parsed) ? '未知' : new Date(parsed).toISOString().slice(0, 10)
+}
+
+// --- 提示段正文 -------------------------------------------------------------
+
+/** 每次委派都要遵守的 description 格式（两个分支共用）。 */
+const DELEGATION_FORMAT = '**每次委派的 `description` 都要以模型开头**：'
+  + '`<provider>/<model>：<任务>`，例如 `deepseek-account/deepseek-v4-pro：读 README 并总结`；'
+  + '没指定模型、交给默认路线时就写 `默认路线：<任务>`。父会话里那张卡片折叠时只显示这一行'
+  + '——用户扫一眼就知道活派给了谁。'
+
+/**
+ * 「按能力表派活」那几条纪律，两个分支共用。
  * @param {boolean} reverse - 是否反向用人
  * @param {boolean} escalateOnFailure - 失败后是否允许升级模型重试一次
- * @param {() => string[]} allowList
+ * @param {boolean} hasCache - 是否已有缓存（决定「表里没有的模型怎么办」那句怎么写）
  * @returns {string}
  */
-function discipline(reverse, escalateOnFailure, allowList) {
-  return `
-# 外包高手：委派纪律
+function hiringSteps(reverse, escalateOnFailure, hasCache) {
+  // 有缓存时不能再说「也就是 list_subagent_models 报过的模型里」——那张表是缓存来的，
+  // 这个会话根本没调过名册。
+  const scope = hasCache
+    ? '你只能在**表内**选：表里有的模型名照抄（provider 与 model 都要对上），别自己编一个；'
+    : '你只能在**能力表内**（也就是 \`list_subagent_models\` 报过的模型里）选，绝不编造模型名；'
+  const fallback = hasCache
+    ? '确实需要表外的模型时，省略 `provider` / `model` 交给默认路线，并说明原因；'
+    : '能力表为空（侦察失败）时才退回上面那套名称启发式；'
+  return `1. **判难度**：把这项子任务归到「${DIFFICULTY_BANDS.join(' / ')}」四档之一。
+2. **按能力表选人**：${selectionRule(reverse)}
+   ${scope}
+   ${fallback}
+   **选定后要显式传给 \`subagent\`**（\`provider\` + \`model\`，必要时带 \`reasoning_effort\`），
+   并按上面的格式把它写进 \`description\`——只在心里想、不写进调用参数，等于没选：
+   模型会走默认路线，卡片上也看不到。
+${escalateOnFailure
+    ? '3. **失败升级**：某个委派失败或明显没做好时，允许**换更高一档的模型重试一次**；\n'
+      + '   第二次仍失败就停下来向用户汇报，不要无限重试。\n'
+      + '4. '
+    : '3. '}**并行优先**：\`subagent\` 默认后台运行（\`run_in_background\` 默认 true），结果落定时
+   你会收到通知——相互独立的活一次派出去、别串行干等；只有下一步确实依赖某个结果时才传
+   \`run_in_background: false\`。**有前台委派在飞的时候新的委派会被拦下**，那说明你本该用
+   后台。需要你当前对话上下文时用 \`subagent_fork\`，全新独立子任务用 \`subagent\`。`
+}
 
-你不亲自做任何事。读文件、写文件、跑命令、搜索、上网、用 workflow、调 skill……
-任何「干活」的调用都会被**硬拦截**（直接 deny，不产生任何副作用）。你被允许的动作
-只有管理：
+/** 还没有缓存时的「用人」部分：先侦察，再派活。 */
+function reconPlan(reverse, escalateOnFailure) {
+  return `## 用人两步走：先摸清人选，再决定派谁
 
-${allowList().map(tool => `- \`${tool}\``).join('\n')}
+${DELEGATION_FORMAT}
 
-遇到拦截不要重试，改成委派。
+你不了解这些模型各自擅长什么，而**本机还没有能力表缓存**，所以第一次委派之前必须先派人去查。
 
-## 说话方式
+### 第一轮：侦察可选模型的能力
 
-- **不自述过程**：不要写「我先去取模型名册」「我现在派一个子智能体去调研」「接下来我会…」
-  这类过程旁白，也不要复述本纪律。直接做，做完直接给结果。
-- **理由只讲一次**：为什么选这个模型，在委派那一刻说明（可选）；**交付最终结果时不要再重复**。
+⚠ **两道顺序是硬的，做不到会被当场拦下**：
 
-## 目标（goal）必须先问下属再定
-
-\`get_goal\` / \`create_goal\` / \`update_goal\` **只属于你**（子 Agent 调会被服务拒绝），
-所以**你不能自己拍脑袋定目标**。定目标前：
-
-1. **先派一个 subagent**，在委派提示里写清任务背景、用户诉求、你初步想到的可能目标，
-   并要求它**评估并给出建议的目标**：一句话 objective、max_goal_rounds、以及为什么这样定
-   （它会用 \`web_search\`、\`read\` 等工具自己调研）。
-2. **等它返回**，把它建议的目标、理由与 max_goal_rounds 原样带回。
-3. **你再调 \`create_goal\`** 登记。
-
-跳过第 1 步直接 \`create_goal\` 属于越权。
-
-## 用人两步走：先摸清人选，再决定派谁
-
-**每次委派的 \`description\` 都要以模型开头**：\`<provider>/<model>：<任务>\`，例如
-\`deepseek-account/deepseek-v4-pro：读 README 并总结\`；没指定模型、交给默认路线时就写
-\`默认路线：<任务>\`。父会话里那张卡片折叠时只显示这一行——用户扫一眼就知道活派给了谁。
-
-你不了解这些模型各自擅长什么，所以**第一次委派之前**必须先派人去查。
-
-### 第一轮：侦察可选模型的能力（每个会话只做一次）
-
-⚠ **顺序是硬的，做不到会被当场拦下**：这次侦察必须传 \`run_in_background: false\`（前台
-等结果），而且**那一轮只发这一次委派**——不要在同一轮里顺手把干活的活也派出去。能力表
-到手之前，任何干活性质的委派都会被拒绝。
+1. **先查名册**：还没调过 \`list_subagent_models\` 就发第一条委派，会被拒绝——名册是侦察
+   的前提，也是你之后贴给侦察兵的清单。
+2. **侦察必须前台**：传 \`run_in_background: false\` 当场等结果，而且**那一轮只发这一次
+   委派**——不要在同一轮里顺手把干活的活也派出去。
 
 1. **取名册**：调 \`list_subagent_models\`（无参数 → 已授权的 provider 列表；再按 provider
    逐个查它公布的模型）。把返回的**完整模型清单**抄下来。该工具不可用、或没列出任何模型时：
@@ -215,7 +386,10 @@ ${allowList().map(tool => `- \`${tool}\``).join('\n')}
    - 要求它对清单里的每个模型用 \`web_search\` 查「擅长什么、适合哪类任务、评测/口碑如何」，
      并**附上来源链接**；
    - 要求它按固定格式返回一张**能力表**：每个模型一行，写清 provider/model、能力档位
-     （轻量快速 / 均衡 / 代码专精 / 旗舰强推理 / 多模态…）、擅长什么、不适合什么、来源。
+     （轻量快速 / 均衡 / 代码专精 / 旗舰强推理 / 多模态…）、擅长什么、不适合什么、来源；
+   - **这份结果会被自动缓存到本机**（之后所有会话直接复用、不再侦察），所以格式要守住：
+     **至少两行、每行含 provider/model，并且出现能力档位词**——达不到就不会被缓存，
+     下个会话还得重来。
 4. **能力表只留在你自己手里**：它是你的选人依据，**不要展示给用户**。搜索不到、或某些
    模型查不到资料时，按名称启发式补上并标注「未核实」，同样不必展示：flash/lite/mini/small=
    轻量快速，standard/medium=均衡，coder/code=代码专精，pro/max/ultra/thinking/reasoner=
@@ -223,55 +397,119 @@ ${allowList().map(tool => `- \`${tool}\``).join('\n')}
 
 ### 之后每一轮：按能力表派活
 
-1. **判难度**：把这项子任务归到「${DIFFICULTY_BANDS.join(' / ')}」四档之一。
-2. **按能力表选人**：${selectionRule(reverse)}
-   你只能在**能力表内**（也就是 \`list_subagent_models\` 报过的模型里）选，绝不编造模型名；
-   能力表为空（侦察失败）时才退回上面那套名称启发式。
-   **选定后要显式传给 \`subagent\`**（\`provider\` + \`model\`，必要时带 \`reasoning_effort\`），
-   并按上面的格式把它写进 \`description\`——只在心里想、不写进调用参数，等于没选：
-   模型会走默认路线，卡片上也看不到。
-${escalateOnFailure
-    ? '3. **失败升级**：某个委派失败或明显没做好时，允许**换更高一档的模型重试一次**；\n'
-      + '   第二次仍失败就停下来向用户汇报，不要无限重试。\n'
-      + '4. '
-    : '3. '}**并行优先**：\`subagent\` 默认后台运行（\`run_in_background\` 默认 true），结果落定时
-   你会收到通知——相互独立的活一次派出去、别串行干等；只有下一步确实依赖某个结果
-   （比如第一轮侦察）时才传 \`run_in_background: false\`。**有前台委派在飞的时候新的委派
-   会被拦下**，那说明你本该用后台。需要你当前对话上下文时用 \`subagent_fork\`，全新独立
-   子任务用 \`subagent\`。
+${hiringSteps(reverse, escalateOnFailure, false)}`
+}
 
-## 交付前自检
+/** 已有缓存时的「用人」部分：直接用表，不再侦察；表正文附在本节末尾。 */
+function cachedPlan(reverse, escalateOnFailure, cache) {
+  return `## 用人：直接按缓存的能力表派活
+
+${DELEGATION_FORMAT}
+
+**能力表已经缓存在本机了**（侦察时间：${formatCacheDate(cache)}），正文就在本节末尾。
+**不要再侦察、不要再调 \`list_subagent_models\`**，直接照表选人。
+
+### 按能力表派活
+
+${hiringSteps(reverse, escalateOnFailure, true)}
+
+## 本机缓存的能力表（${formatCacheDate(cache)}）
+
+${cache.body}`
+}
+
+/** 交付前自检（两个分支共用，但「按上面第几条重试」跟着升级开关走）。 */
+function selfCheck(escalateOnFailure) {
+  const retry = escalateOnFailure
+    ? '明显不合格就按上面第 3 条升级重试，或把缺口如实报给用户。'
+    : '明显不合格就把缺口如实报给用户，不要自己硬凑一个结论。'
+  return `## 交付前自检
 
 子 Agent 的结论**不是事实**，只是待核验的材料：先看它有没有交出完成标准要求的产出，
-明显不合格就按上面第 3 条升级重试，或把缺口如实报给用户。你自己无法核验的部分（读文件、
-跑命令）只能靠「再派一个 subagent 去核」——这也是委派。`.trim()
+${retry}你自己无法核验的部分（读文件、跑命令）只能靠「再派一个 subagent 去核」——这也是委派。`
+}
+
+/**
+ * 纪律段正文。`text` 是函数，每次装配重新拼：白名单跟着配置走，能力表跟着缓存文件走。
+ * @param {boolean} reverse - 是否反向用人
+ * @param {boolean} escalateOnFailure - 失败后是否允许升级模型重试一次
+ * @param {() => string[]} allowList
+ * @param {{ body: string, updatedAt?: string, source?: string } | undefined} cache - 当前缓存
+ * @returns {string}
+ */
+function discipline(reverse, escalateOnFailure, allowList, cache) {
+  return [
+    `# 外包高手：委派纪律
+
+你不亲自做任何事。读文件、写文件、跑命令、搜索、上网、用 workflow、调 skill……
+任何「干活」的调用都会被**硬拦截**（直接 deny，不产生任何副作用）。你被允许的动作
+只有管理：
+
+${allowList().map(tool => `- \`${tool}\``).join('\n')}
+
+遇到拦截不要重试，改成委派。`,
+    `## 说话方式
+
+- **不自述过程**：不要写「我先去取模型名册」「我现在派一个子智能体去调研」「接下来我会…」
+  这类过程旁白，也不要复述本纪律。直接做，做完直接给结果。
+- **理由只讲一次**：为什么选这个模型，在委派那一刻说明（可选）；**交付最终结果时不要再重复**。`,
+    `## 目标（goal）必须先问下属再定
+
+\`get_goal\` / \`create_goal\` / \`update_goal\` **只属于你**（子 Agent 调会被服务拒绝），
+所以**你不能自己拍脑袋定目标**。定目标前：
+
+1. **先派一个 subagent**，在委派提示里写清任务背景、用户诉求、你初步想到的可能目标，
+   并要求它**评估并给出建议的目标**：一句话 objective、max_goal_rounds、以及为什么这样定
+   （它会用 \`web_search\`、\`read\` 等工具自己调研）。
+2. **等它返回**，把它建议的目标、理由与 max_goal_rounds 原样带回。
+3. **你再调 \`create_goal\`** 登记。
+
+跳过第 1 步直接 \`create_goal\` 属于越权。`,
+    cache === undefined ? reconPlan(reverse, escalateOnFailure) : cachedPlan(reverse, escalateOnFailure, cache),
+    selfCheck(escalateOnFailure),
+  ].join('\n\n')
 }
 
 /**
  * 挂载「外包高手」。
  * @param {import('@deepseek-ai/cordis').Context} ctx
- * @param {{ allowTools?: string[], reverseHiring?: boolean, escalateOnFailure?: boolean }} [config]
+ * @param {{
+ *   allowTools?: string[], reverseHiring?: boolean, escalateOnFailure?: boolean,
+ *   capabilityCache?: boolean, storeDir?: string,
+ * }} [config]
  */
 export function apply(ctx, config = {}) {
   const settings = config ?? {}
   const reverseHiring = settings.reverseHiring === true
   const escalateOnFailure = settings.escalateOnFailure !== false
+  const cacheEnabled = settings.capabilityCache !== false
   const extraAllowed = Array.isArray(settings.allowTools)
     ? settings.allowTools.filter(tool => typeof tool === 'string' && tool.length > 0)
     : []
   const allowTools = new Set([...DEFAULT_ALLOW, ...extraAllowed])
 
+  // 能力表缓存。关掉它（capabilityCache: false）就退回「每个会话各自侦察一次」的老行为。
+  const store = createStore(resolveStoreDir(settings.storeDir))
+  const readCache = () => (cacheEnabled ? store.read() : undefined)
+
   // --- 1. 硬拦截 + 顺序纪律 ----------------------------------------------
   // 顺序纪律是实测逼出来的：`subagent` 在 continuable 实例上**默认后台运行**，光在提示里
   // 写「第一轮必须传 run_in_background: false」照样会被无视——模型会把侦查和干活在同一轮
   // 里一起发出去，等不到能力表。这里用两道状态把它兜死（都只按发起方 agent 记）：
-  //   ① 每条会话的第一条委派必须是**前台等结果**（那一条就是第一轮侦查）；
-  //   ② 有前台委派在飞时，不许再派下一条（后台委派不受这条限制，所以「并行优先」照旧）。
+  //   ① 缓存为空时，第一条委派必须是**前台等结果**（那一条就是第一轮侦查）；
+  //   ② 缓存为空时，还没查过名册（`list_subagent_models`）之前不许委派——否则模型会直接
+  //      派活，侦察永远不发生，缓存也就永远是空的；
+  //   ③ 有前台委派在飞时，不许再派下一条（后台委派不受这条限制，所以「并行优先」照旧）。
+  // 缓存存在时 ①② 自动取消：那时没有侦察要做，第一条委派可以是后台并行的。
   // 置位/清位只用「同一调用的 pre-execute / post-execute 配对」——post-execute 连抛错的
   // 工具都会收到；再加 agent/pre-step 兜底：新的一步开始就说明上一轮已结束、不可能还有
   // 前台调用在飞。两道保险合起来保证不会把领导永久锁死。
   const delegatedOnce = new Set()
   const foregroundInFlight = new Set()
+  /** 已经调过名册工具的发起方（缓存为空时的那道门）。 */
+  const rosterRead = new Set()
+  /** 待缓存的侦察：发起方 → 那条委派的模型路线（跑完就写进缓存）。 */
+  const reconPending = new Map()
   /**
    * 待认领的委派：发起方 agent id → 队列（模型 + 任务）。
    *
@@ -297,6 +535,15 @@ export function apply(ctx, config = {}) {
     return claim
   }
 
+  /** 某个工具在当前 preset 的 schema 里有没有（用它判断「这组合里到底有没有这个工具」）。 */
+  const hasTool = (agent, toolName) => {
+    try {
+      return ctx.tools.schemas(agent).some(candidate => candidate?.name === toolName)
+    } catch {
+      return false
+    }
+  }
+
   /** 这个委派工具在当前 preset 的 schema 里是否暴露 `run_in_background`（没暴露就无从要求前台）。 */
   const supportsBackgroundFlag = (agent, toolName) => {
     try {
@@ -304,6 +551,21 @@ export function apply(ctx, config = {}) {
       return schema?.parameters?.properties?.run_in_background !== undefined
     } catch {
       return false
+    }
+  }
+
+  /** 把这次侦察结果写进缓存（正文不像能力表就不写——宁缺勿脏）。 */
+  const persistRecon = (route, result) => {
+    const text = resultText(result)
+    if (text === '' || !looksLikeCapabilityTable(text)) {
+      ctx.logger?.debug?.('outsourcing-expert: 侦察结果不像能力表，未写入缓存')
+      return
+    }
+    try {
+      store.write(text, `子智能体侦察（${route}）`)
+      ctx.logger?.debug?.(`outsourcing-expert: 能力表已缓存到 ${store.file}`)
+    } catch (error) {
+      ctx.logger?.debug?.(`outsourcing-expert: 能力表写入失败：${String(error)}`)
     }
   }
 
@@ -345,8 +607,27 @@ export function apply(ctx, config = {}) {
     const agent = exec?.agent
     const leader = agent !== undefined && !isSubagent(agent)
 
+    // 名册一到手就记下：缓存为空时那道「先查名册再委派」的门据此放行。
+    // 在 pre-execute 记（而不是等它成功）是因为模型常把「取名册」和「派侦察兵」放在
+    // 同一轮的同一个批次里，而同一批次的 pre-execute 是按顺序逐个跑的——等 post-execute
+    // 就会把自己的侦察兵一起拦掉。
+    if (leader && toolName === ROSTER_TOOL) rosterRead.add(agent.id)
+
     if (leader && DELEGATION_TOOLS.has(toolName) && supportsBackgroundFlag(agent, toolName)) {
       const id = agent.id
+      // 这一条之前是否必须先做侦察：缓存开着且还没有表时要做；缓存整个关掉时按老行为
+      // 「每个会话各自侦察一次」也要做（否则关掉缓存就等于把两道门也一起关了）。
+      const needsRecon = cacheEnabled ? readCache() === undefined : true
+      const first = !delegatedOnce.has(id)
+
+      if (needsRecon && first && !rosterRead.has(id) && hasTool(agent, ROSTER_TOOL)) {
+        return {
+          kind: 'deny',
+          reason: '【外包高手】本机还没有模型能力表缓存，而你还没查过名册：先调 '
+            + '`list_subagent_models` 把可选模型清单拿到手，再发第一条委派（那一条就是侦察）。'
+            + '侦察结果会被自动缓存到本机，之后所有会话都不用再侦察。',
+        }
+      }
       if (foregroundInFlight.has(id)) {
         return {
           kind: 'deny',
@@ -355,7 +636,7 @@ export function apply(ctx, config = {}) {
         }
       }
       const foreground = exec?.arguments?.run_in_background === false
-      if (!delegatedOnce.has(id) && !foreground) {
+      if (needsRecon && first && !foreground) {
         return {
           kind: 'deny',
           reason: '【外包高手】第一轮侦查必须先做、而且必须当场等结果：这次委派请传 '
@@ -365,6 +646,8 @@ export function apply(ctx, config = {}) {
       }
       delegatedOnce.add(id)
       if (foreground) foregroundInFlight.add(id)
+      // 空表时的第一条委派就是侦察：记下它的路线，等结果落定后写进缓存。
+      if (cacheEnabled && needsRecon && first) reconPending.set(id, delegationRoute(exec))
       // 记下这次委派的「模型 + 任务」：等 `subagent/start` 里按发起方认领并写成子会话标题。
       rememberDelegation(id, exec)
       return next()
@@ -381,20 +664,33 @@ export function apply(ctx, config = {}) {
     }
   })
 
-  // 委派一落定：① 放开「前台在飞」；② 在结果正文里补一行「模型 + 任务」——这行由插件
-  // 拼出来，所以委派卡片上一定看得到，不依赖模型自己说明。先走完下游（钩子之类的策略），
-  // 再合并：下游若拦截、或整块替换了 value，就原样放行（同时给 content 与 value 会被
-  // 注册表判为非法）。
+  // 委派一落定：① 放开「前台在飞」；② 侦察那条的结果写进能力表缓存；③ 在结果正文里补
+  // 一行「模型 + 任务」——这行由插件拼出来，所以委派卡片上一定看得到，不依赖模型自己说明。
+  // 先走完下游（钩子之类的策略），再合并：下游若拦截、或整块替换了 value，就原样放行
+  // （同时给 content 与 value 会被注册表判为非法）。
   ctx.on('tools/post-execute', async (exec, result, next) => {
-    if (exec?.agent !== undefined && DELEGATION_TOOLS.has(exec?.name)) {
-      foregroundInFlight.delete(exec.agent.id)
+    const agent = exec?.agent
+    const delegation = DELEGATION_TOOLS.has(exec?.name)
+    if (agent !== undefined && delegation) foregroundInFlight.delete(agent.id)
+
+    // 侦察结果缓存：只有「空表时那条被标成侦察的委派」才会命中，而且要求它成功、
+    // 正文像能力表。失败就不写（表留着空，下个会话重来）。
+    // 注意只有**前台**委派的结果里才有子智能体的产出（后台那条只带回执），而侦察按纪律
+    // 本来就是前台，所以这里不会漏。
+    if (agent !== undefined && delegation && !isSubagent(agent) && reconPending.has(agent.id)) {
+      if (result?.isError !== true) {
+        const route = reconPending.get(agent.id)
+        reconPending.delete(agent.id)
+        persistRecon(route, result)
+      }
     }
+
     const downstream = await next()
-    if (!DELEGATION_TOOLS.has(exec?.name)) return downstream
+    if (!delegation) return downstream
     if (result?.isError === true) {
       // 这条委派没跑起来（参数不合法、被别的策略拒了…）：把它的待认领项丢掉，否则下一件
       // 子会话会张冠李戴（实测踩过：失败的前台委派把任务安到了别的子会话头上）。
-      if (exec?.agent !== undefined && !isSubagent(exec.agent)) claimDelegation(exec.agent.id)
+      if (agent !== undefined && !isSubagent(agent)) claimDelegation(agent.id)
       return downstream
     }
     if (downstream.kind === 'block' || Object.hasOwn(downstream, 'value')) return downstream
@@ -408,6 +704,80 @@ export function apply(ctx, config = {}) {
   ctx.systemPrompt.section({
     name: 'outsourcing-expert:discipline',
     order: 200,
-    text: () => discipline(reverseHiring, escalateOnFailure, () => [...allowTools]),
+    // 缓存正文是模型写的，可能含 `{{...}}` 字面量；宿主对 {{变量}} 是严格的
+    // （未知引用直接抛错，打断整轮装配），所以这一段必须关掉插值。
+    interpolate: false,
+    text: () => discipline(reverseHiring, escalateOnFailure, () => [...allowTools], readCache()),
   })
+
+  // --- 3. 三条命令：看 / 清空 / 重新侦察 -----------------------------------
+  // 命令也是 scope 化的，所以只有这两个 preset 的会话看得见。`commands` 不是必需服务，
+  // 取不到就安静跳过（这个组合里没有命令系统而已）。三条各做一件事，不靠参数分派。
+  if (cacheEnabled) {
+    const commands = ctx.get('commands')
+
+    commands?.register?.({
+      name: 'outsourcing-models',
+      description: '查看本机缓存的模型能力表（外包高手）',
+      handler: () => {
+        const cache = store.read()
+        if (cache === undefined) {
+          return {
+            kind: 'success',
+            text: `本机还没有能力表缓存。\n路径：${store.file}\n`
+              + '下一条会话在派第一条委派之前会先做一次侦察，侦察结果会自动写到这里。',
+          }
+        }
+        return {
+          kind: 'success',
+          text: `路径：${store.file}\n更新：${cache.updatedAt ?? '未知'}\n`
+            + `来源：${cache.source ?? '未知'}\n\n${cache.body}`,
+        }
+      },
+    })
+
+    commands?.register?.({
+      name: 'outsourcing-models-clear',
+      description: '清空本机缓存的模型能力表（外包高手）',
+      handler: () => {
+        try {
+          store.clear()
+        } catch (error) {
+          return { kind: 'error', text: `清空失败：${String(error)}` }
+        }
+        return {
+          kind: 'success',
+          text: `已清空 ${store.file}\n`
+            + '下一条新会话在派第一条委派之前会重新侦察一次。本会话不强制重来'
+            + '——要连当前会话一起重来，用 /outsourcing-models-init。',
+        }
+      },
+    })
+
+    commands?.register?.({
+      name: 'outsourcing-models-init',
+      description: '清掉能力表缓存并让当前会话重新侦察一次（外包高手）',
+      handler: (invocation) => {
+        try {
+          store.clear()
+        } catch (error) {
+          return { kind: 'error', text: `清空失败：${String(error)}` }
+        }
+        const id = invocation?.agent?.id
+        if (typeof id === 'string') {
+          // 只重置「这个会话是否已经侦察过」这一组状态：下一次委派重新受「先查名册 +
+          // 前台侦察」两道门约束。在飞的委派状态（foregroundInFlight）不动——那条会
+          // 由它自己的 post-execute / pre-step 清掉。
+          delegatedOnce.delete(id)
+          rosterRead.delete(id)
+          reconPending.delete(id)
+        }
+        return {
+          kind: 'success',
+          text: '已清空能力表缓存，本会话也重新初始化：下一条委派之前必须先调 '
+            + 'list_subagent_models 拿名册，再派一个前台侦察兵；侦察结果会自动写回缓存。',
+        }
+      },
+    })
+  }
 }

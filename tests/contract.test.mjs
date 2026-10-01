@@ -11,21 +11,39 @@
  *   - 白名单必须含委派工具本身，否则领导连派活都被自己拦掉。
  *   - 子 Agent 判据看会话头，不是「登记过的 id」。
  *   - 不自述过程、能力表不外露、用人理由只讲一次、模型名写进 `description`（提示层要求，用文案断言钉住）。
- *   - 两个 preset 只靠 `reverseHiring` 区分；没有开关，所以不注册任何工具与命令。
+ *   - 能力表缓存：空表时才拦「没查名册就委派」，侦察结果通过体检才写盘，表存在时不再要求
+ *     前台、不再要求名册，提示段换成「直接用表」并把表正文内联进去。
+ *   - 提示段必须 `interpolate: false`：宿主对 `{{变量}}` 是严格的，模型写的表里出现
+ *     `{{model}}` 会抛错打断整轮装配。
+ *   - 两个 preset 只靠 `reverseHiring` 区分；工具仍为 0，命令只有 `/outsourcing-models`。
  */
 
-import test from 'node:test'
+import test, { after } from 'node:test'
 import assert from 'node:assert/strict'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import { apply, inject, name } from '../src/index.js'
+
+/** 每个桩拿到的临时缓存目录；整个文件跑完统一删掉。 */
+const TEMP_DIRS = []
+after(() => {
+  for (const dir of TEMP_DIRS) rmSync(dir, { recursive: true, force: true })
+})
 
 /**
  * 记录型 ctx 桩：把插件注册的每样东西都收起来，供断言检查。
  * `exposeBackgroundFlag: false` 模拟「这个 preset 的委派工具没暴露 run_in_background」，
  * 用来验证插件在这种情况下不会把领导锁死。
+ * `exposeRosterTool: false` 模拟「这个组合里没有 list_subagent_models」，用来验证
+ * 「先查名册」那道门会自己让开、不会把领导锁死。
+ *
+ * 每个桩都会拿到一个**独立的临时缓存目录**（config.storeDir），因为能力表缓存是按路径
+ * 读写的——不隔离的话测试会去读真机上的 `~/.dsh/outsourcing-expert/models.md`。
  */
 function mount(config, options = {}) {
-  const { exposeBackgroundFlag = true } = options
+  const { exposeBackgroundFlag = true, exposeRosterTool = true } = options
   const listeners = []
   const sections = []
   const tools = []
@@ -33,6 +51,8 @@ function mount(config, options = {}) {
   /** 子会话命名记录与「live 会话」桩：`children` 里放了哪个 id，就代表哪个子会话是活的。 */
   const renames = []
   const children = new Map()
+  const storeDir = mkdtempSync(join(tmpdir(), 'dsh-outsourcing-expert-test-'))
+  TEMP_DIRS.push(storeDir)
   const delegationSchema = (schemaName) => ({
     name: schemaName,
     parameters: { properties: exposeBackgroundFlag ? { run_in_background: {} } : {} },
@@ -44,10 +64,14 @@ function mount(config, options = {}) {
       register: (definition) => tools.push(definition),
       schemas: (agent) => (agent === undefined
         ? []
-        : [delegationSchema('subagent'), delegationSchema('subagent_fork')]),
+        : [
+          delegationSchema('subagent'),
+          delegationSchema('subagent_fork'),
+          ...exposeRosterTool ? [{ name: 'list_subagent_models', parameters: { properties: {} } }] : [],
+        ]),
     },
     get: (key) => {
-      // 故意提供 commands 服务：插件即使能拿到它，也不该注册任何命令。
+      // 命令系统是可选的：插件挂得上就该注册 `/outsourcing-models`，取不到也不该崩。
       if (key === 'commands') return { register: (definition) => commands.push(definition) }
       if (key === 'sessions') return { get: (id) => children.get(id) }
       if (key === 'sessionTitle') {
@@ -63,14 +87,36 @@ function mount(config, options = {}) {
       return undefined
     },
   }
-  apply(ctx, config)
+  apply(ctx, { storeDir, ...config })
   const listener = (eventName) => {
     const found = listeners.filter(entry => entry.eventName === eventName)
     assert.equal(found.length, 1, `${eventName} 应恰好注册一个监听器，实得 ${found.length}`)
     return found[0].listener
   }
-  return { listeners, sections, tools, commands, renames, children, listener }
+  const command = (commandName) => commands.find(entry => entry.name === commandName)
+  return { listeners, sections, tools, commands, renames, children, listener, command, storeDir }
 }
+
+/** 缓存文件路径（与插件内部约定一致：storeDir/models.md）。 */
+const cacheFile = (storeDir) => join(storeDir, 'models.md')
+
+/** 直接写一份缓存，模拟「之前某次会话已经侦察过」。 */
+function seedCache(storeDir, body, meta = {}) {
+  mkdirSync(storeDir, { recursive: true })
+  writeFileSync(
+    cacheFile(storeDir),
+    `<!-- dsh-outsourcing-expert ${JSON.stringify({ updatedAt: '2026-10-01T00:00:00.000Z', ...meta })} -->\n${body}\n`,
+    'utf8',
+  )
+}
+
+/** 一份通过体检（≥2 行 provider/model + 档位词）的能力表文本。 */
+const CAPABILITY_TABLE = [
+  '| 模型 | 档位 | 擅长 | 不适合 | 来源 |',
+  '| --- | --- | --- | --- | --- |',
+  '| deepseek-account/deepseek-v4-pro | 旗舰强推理 | 复杂重构 | 闲聊 | https://example.com/a |',
+  '| xiaomi-tp/mimo-v2.6-flash | 轻量快速 | 单文件改动 | 长链路推理 | https://example.com/b |',
+].join('\n')
 
 /** 一次工具调用的 exec 桩。`depth` 决定它是领导（0）还是下属（≥1），`args` 是它的参数。 */
 function exec(toolName, depth = 0, args = {}) {
@@ -88,6 +134,9 @@ const next = () => Promise.resolve(ALLOWED)
 /** post-execute 的 `next()` 按契约返回一个 PostToolDecision，不是哨兵。 */
 const nextPost = () => Promise.resolve({ kind: 'accept' })
 
+/** 模拟「先查名册」：缓存为空时，这是发第一条委派的前提（同一批次里 pre-execute 按顺序跑）。 */
+const readRoster = (preExecute) => preExecute(exec('list_subagent_models'), next)
+
 test('模块导出符合 Cordis 插件契约', () => {
   assert.equal(name, 'outsourcing-expert')
   assert.deepEqual(inject, ['tools', 'systemPrompt'])
@@ -96,25 +145,30 @@ test('模块导出符合 Cordis 插件契约', () => {
   assert.ok(!inject.includes('config'), "inject 不能包含 'config'：配置由 apply 的第二参数传入")
 })
 
-test('只注册四个监听器与一个提示段，不注册任何工具或命令', () => {
+test('只注册四个监听器、一个提示段与一个命令，不注册任何工具', () => {
   const { listeners, sections, tools, commands } = mount({})
   assert.deepEqual(
     listeners.map(entry => entry.eventName).sort(),
     ['agent/pre-step', 'subagent/start', 'tools/post-execute', 'tools/pre-execute'],
   )
   assert.equal(sections.length, 1)
-  // 「选人开关去掉」之后，插件不再需要任何模型面向的工具或斜杠命令。
   assert.equal(tools.length, 0, '不应注册工具')
-  assert.equal(commands.length, 0, '不应注册命令')
+  // 「选人开关」早就去掉了；现在只有能力表缓存的三条命令：看 / 清空 / 重新侦察。
+  assert.deepEqual(
+    commands.map(entry => entry.name),
+    ['outsourcing-models', 'outsourcing-models-clear', 'outsourcing-models-init'],
+  )
 })
 
-test('提示段用 text 字段，且正文可渲染', () => {
+test('提示段用 text 字段、关掉变量插值，且正文可渲染', () => {
   const { sections } = mount({})
   const [section] = sections
   assert.equal(section.name, 'outsourcing-expert:discipline')
   assert.equal(typeof section.order, 'number')
   assert.equal(typeof section.text, 'function')
   assert.ok(!('content' in section), 'PromptSection 的字段是 text，不是 content')
+  // 缓存正文是模型写的，可能含 `{{model}}`；宿主对 {{变量}} 是严格的（未知引用抛错）。
+  assert.equal(section.interpolate, false, '必须关掉插值，否则模型写的表能打断整轮装配')
 
   const text = section.text()
   assert.match(text, /外包高手/)
@@ -194,7 +248,8 @@ test('白名单内的管理工具与委派工具放行', async () => {
     assert.equal(await preExecute(exec(toolName), next), ALLOWED, `${toolName} 应放行`)
   }
 
-  // 两个委派工具也放行，但要满足下面的顺序纪律（所以放在顺序测试里逐条断言）。
+  // 两个委派工具也放行，但要先查名册、再满足下面的顺序纪律（所以放在顺序测试里逐条断言）。
+  await readRoster(preExecute)
   assert.equal(await preExecute(exec('subagent', 0, { run_in_background: false }), next), ALLOWED)
 
   // 旧的开关工具已移除，也不再放行。
@@ -205,6 +260,15 @@ test('顺序纪律：第一条委派必须是前台，前台在飞时不许再�
   const { listener } = mount({})
   const preExecute = listener('tools/pre-execute')
   const postExecute = listener('tools/post-execute')
+
+  // ⓪ 缓存为空时，还没查名册就想委派 → 被「先查名册」那道门拦下
+  const noRoster = await preExecute(exec('subagent', 0, { description: '侦查' }), next)
+  assert.equal(noRoster.kind, 'deny')
+  assert.match(noRoster.reason, /list_subagent_models/)
+  assert.match(noRoster.reason, /还没有模型能力表缓存/)
+
+  // 查过名册（同一批次的 pre-execute 按顺序跑，所以不必等它成功）
+  await readRoster(preExecute)
 
   // ① 第一条委派没传 run_in_background: false（默认后台）→ 拦
   const first = await preExecute(exec('subagent', 0, { description: '侦查' }), next)
@@ -293,6 +357,7 @@ test('子会话出现时按发起方认领「模型 + 任务」写成标题（�
   const subagentStart = mounted.listener('subagent/start')
   mounted.children.set('child-1', { id: 'child-1', header: { parentSession: 'agent-0' } })
 
+  await readRoster(preExecute)
   await preExecute(exec('subagent', 0, {
     description: '读 README',
     provider: 'xiaomi-tp',
@@ -320,6 +385,7 @@ test('没跑起来的委派会丢掉待认领项，不会张冠李戴', async ()
   const failed = { isError: true, content: [], error: { message: 'x' } }
 
   // ① 第一条委派（前台）放行后失败 → 它的待认领项在结果里被丢掉
+  await readRoster(preExecute)
   await preExecute(exec('subagent', 0, { description: '侦查', run_in_background: false }), next)
   await postExecute(exec('subagent', 0, { run_in_background: false }), failed, nextPost)
 
@@ -339,6 +405,7 @@ test('子会话命名尽力而为：没有待认领 / 不在册 / 无 parentSess
   const mounted = mount({})
   const preExecute = mounted.listener('tools/pre-execute')
   const subagentStart = mounted.listener('subagent/start')
+  await readRoster(preExecute)
   await preExecute(exec('subagent', 0, { description: '侦查', run_in_background: false }), next)
 
   subagentStart({ id: 'missing' })                        // 会话不在册
@@ -362,7 +429,7 @@ test('子会话命名尽力而为：没有待认领 / 不在册 / 无 parentSess
     },
     get: (key) => (key === 'sessions' ? { get: (id) => children.get(id) } : undefined),
   }
-  assert.doesNotThrow(() => apply(bare, undefined))
+  assert.doesNotThrow(() => apply(bare, { storeDir: join(tmpdir(), 'dsh-outsourcing-expert-bare') }))
   const barePre = services.find(entry => entry.eventName === 'tools/pre-execute').listener
   const bareStart = services.find(entry => entry.eventName === 'subagent/start').listener
   await barePre(exec('subagent', 0, { description: '活', run_in_background: false }), next)
@@ -375,6 +442,7 @@ test('顺序纪律的兜底与边界', async () => {
   const preStep = listener('agent/pre-step')
 
   // 兜底：post-execute 没来（状态没清掉）时，新的一步开始就清掉「前台在飞」。
+  await readRoster(preExecute)
   assert.equal(await preExecute(exec('subagent', 0, { run_in_background: false }), next), ALLOWED)
   assert.equal((await preExecute(exec('subagent', 0, { run_in_background: true }), next)).kind, 'deny')
   assert.equal(await preStep({ agent: exec('subagent').agent }, next), ALLOWED)
@@ -419,7 +487,7 @@ test('配置可以追加白名单（空串被过滤）', async () => {
   assert.equal((await preExecute(exec('edit'), next)).kind, 'deny', '未追加的干活工具仍被拦')
 })
 
-test('没有 commands 服务时也照常工作（可选读取）', () => {
+test('没有 commands 服务时也照常工作（缓存开着、命令注册可选）', () => {
   const listeners = []
   const ctx = {
     on: (eventName, listener) => listeners.push({ eventName, listener }),
@@ -427,6 +495,167 @@ test('没有 commands 服务时也照常工作（可选读取）', () => {
     tools: { register: () => {} },
     get: () => undefined,
   }
-  assert.doesNotThrow(() => apply(ctx, undefined))
+  assert.doesNotThrow(() => apply(ctx, { storeDir: join(tmpdir(), 'dsh-outsourcing-expert-nocommands') }))
   assert.equal(listeners.filter(entry => entry.eventName === 'tools/pre-execute').length, 1)
+})
+
+test('能力表缓存：侦察结果自动落盘，之后提示段换成「直接用表」并内联表正文', async () => {
+  const mounted = mount({})
+  const preExecute = mounted.listener('tools/pre-execute')
+  const postExecute = mounted.listener('tools/post-execute')
+  const recon = { description: 'x/mimo：侦察模型能力表', provider: 'x', model: 'mimo', run_in_background: false }
+
+  assert.match(mounted.sections[0].text(), /用人两步走/, '一开始没有表：仍是侦察版提示')
+
+  await readRoster(preExecute)
+  assert.equal(await preExecute(exec('subagent', 0, recon), next), ALLOWED)
+
+  // 侦察结果落定 → 通过体检 → 写进缓存
+  await postExecute(
+    exec('subagent', 0, recon),
+    { isError: false, content: [{ type: 'text', text: CAPABILITY_TABLE }] },
+    nextPost,
+  )
+  const written = readFileSync(cacheFile(mounted.storeDir), 'utf8')
+  assert.match(written, /^<!-- dsh-outsourcing-expert \{"updatedAt":"/, '首行是元信息注释')
+  assert.match(written, /deepseek-account\/deepseek-v4-pro/)
+  assert.match(written, /"source":"子智能体侦察（x \/ mimo）"/, '元信息里记下是哪条侦察得到的')
+
+  // 提示段换成「直接用表」：不再侦察，表正文内联进来
+  const text = mounted.sections[0].text()
+  assert.match(text, /能力表已经缓存在本机了/)
+  assert.match(text, /不要再侦察、不要再调\s*`list_subagent_models`/)
+  assert.match(text, /## 本机缓存的能力表（\d{4}-\d{2}-\d{2}）/)
+  assert.match(text, /xiaomi-tp\/mimo-v2\.6-flash/)
+  assert.ok(!/用人两步走/.test(text), '有表时不该再讲「两步走」')
+  assert.ok(!/第一轮侦查必须先做/.test(text), '有表时不该再要求前台侦察')
+  // 选人那几条纪律还在，而且「表里没有的模型怎么办」换成了带缓存的说法
+  assert.match(text, /选定后要显式传给\s*`subagent`/)
+  assert.match(text, /确实需要表外的模型时/)
+})
+
+test('缓存只在空的时候写：已有表时既不覆盖，也不要求前台或名册', async () => {
+  const mounted = mount({})
+  seedCache(mounted.storeDir, CAPABILITY_TABLE)
+  const preExecute = mounted.listener('tools/pre-execute')
+  const postExecute = mounted.listener('tools/post-execute')
+  const before = readFileSync(cacheFile(mounted.storeDir), 'utf8')
+
+  // 有表：第一条委派直接后台并行也放行（不必前台、不必先查名册）
+  assert.equal(await preExecute(exec('subagent', 0, { run_in_background: true }), next), ALLOWED)
+
+  // 落定的结果即使又是一张表，也不覆盖已有缓存
+  await postExecute(
+    exec('subagent', 0, { run_in_background: true }),
+    { isError: false, content: [{ type: 'text', text: CAPABILITY_TABLE }] },
+    nextPost,
+  )
+  assert.equal(readFileSync(cacheFile(mounted.storeDir), 'utf8'), before, '已有缓存不该被覆盖')
+})
+
+test('侦察结果不像能力表就不写缓存（宁缺勿脏）', async () => {
+  const mounted = mount({})
+  const preExecute = mounted.listener('tools/pre-execute')
+  const postExecute = mounted.listener('tools/post-execute')
+
+  await readRoster(preExecute)
+  await preExecute(exec('subagent', 0, { description: '侦查', run_in_background: false }), next)
+  await postExecute(
+    exec('subagent', 0, { run_in_background: false }),
+    { isError: false, content: [{ type: 'text', text: '我读完了 README，结论是它描述了插件的用法。' }] },
+    nextPost,
+  )
+  assert.ok(!existsSync(cacheFile(mounted.storeDir)), '不像能力表就不该留下文件')
+  assert.match(mounted.sections[0].text(), /用人两步走/, '没有表时仍是侦察版提示')
+
+  // 侦察失败时同样不写
+  const second = mount({})
+  const pre2 = second.listener('tools/pre-execute')
+  const post2 = second.listener('tools/post-execute')
+  await readRoster(pre2)
+  await pre2(exec('subagent', 0, { description: '侦查', run_in_background: false }), next)
+  await post2(
+    exec('subagent', 0, { run_in_background: false }),
+    { isError: true, content: [], error: { message: '炸了' } },
+    nextPost,
+  )
+  assert.ok(!existsSync(cacheFile(second.storeDir)), '失败的结果不该写进缓存')
+})
+
+test('边界：没有 list_subagent_models 时那道门让开；capabilityCache: false 退回每会话侦察', async () => {
+  // 组合里没有名册工具 → 不拦（否则就是把人锁死）
+  const noRoster = mount({}, { exposeRosterTool: false })
+  assert.equal(
+    await noRoster.listener('tools/pre-execute')(exec('subagent', 0, { run_in_background: false }), next),
+    ALLOWED,
+  )
+
+  // 关掉缓存 → 回到「每个会话各自侦察一次」：仍要求前台、仍要求先查名册，但不写文件、不注册命令
+  const off = mount({ capabilityCache: false })
+  const preExecute = off.listener('tools/pre-execute')
+  const postExecute = off.listener('tools/post-execute')
+  assert.equal(off.commands.length, 0, '缓存关掉时不注册命令')
+  assert.equal((await preExecute(exec('subagent', 0, { run_in_background: true }), next)).kind, 'deny')
+  await readRoster(preExecute)
+  await preExecute(exec('subagent', 0, { description: '侦察', run_in_background: false }), next)
+  await postExecute(
+    exec('subagent', 0, { run_in_background: false }),
+    { isError: false, content: [{ type: 'text', text: CAPABILITY_TABLE }] },
+    nextPost,
+  )
+  assert.ok(!existsSync(cacheFile(off.storeDir)), '缓存关掉时不该写文件')
+  assert.match(off.sections[0].text(), /用人两步走/)
+})
+
+test('三条命令：看 / 清空 / 初始化（手写文件也认）', () => {
+  const mounted = mount({})
+  const show = mounted.command('outsourcing-models').handler
+  const clear = mounted.command('outsourcing-models-clear').handler
+
+  const empty = show()
+  assert.equal(empty.kind, 'success')
+  assert.match(empty.text, /还没有能力表缓存/)
+  assert.match(empty.text, /models\.md/)
+
+  seedCache(mounted.storeDir, CAPABILITY_TABLE)
+  const shown = show()
+  assert.equal(shown.kind, 'success')
+  assert.match(shown.text, /更新：2026-10-01T00:00:00\.000Z/)
+  assert.match(shown.text, /deepseek-account\/deepseek-v4-pro/)
+
+  // 手工写的文件没有首行元信息：整个文件都算正文，时间显示为未知
+  writeFileSync(cacheFile(mounted.storeDir), CAPABILITY_TABLE, 'utf8')
+  assert.match(show().text, /更新：未知/)
+  assert.match(mounted.sections[0].text(), /本机缓存的能力表（未知）/)
+
+  const cleared = clear()
+  assert.equal(cleared.kind, 'success')
+  assert.match(cleared.text, /已清空/)
+  // 清空只说「下一条新会话会重新侦察」，要连当前会话一起重来得用 init——文案里要指过去。
+  assert.match(cleared.text, /outsourcing-models-init/)
+  assert.ok(!existsSync(cacheFile(mounted.storeDir)))
+  assert.match(show().text, /还没有能力表缓存/)
+})
+
+test('`/outsourcing-models-init`：清缓存 + 把本会话两道门重新装上', async () => {
+  const mounted = mount({})
+  const preExecute = mounted.listener('tools/pre-execute')
+  seedCache(mounted.storeDir, CAPABILITY_TABLE)
+
+  // 有表：第一条委派直接后台也放行（两道门是关的）
+  assert.equal(await preExecute(exec('subagent', 0, { run_in_background: true }), next), ALLOWED)
+
+  const init = mounted.command('outsourcing-models-init').handler
+  const result = init({ rawInput: '', agent: { id: 'agent-0' } })
+  assert.equal(result.kind, 'success')
+  assert.ok(!existsSync(cacheFile(mounted.storeDir)), '初始化先清掉旧表')
+  assert.match(result.text, /list_subagent_models/)
+
+  // 门重新装上：没查名册就委派 → 拦；查过名册 + 前台 → 放行
+  const denied = await preExecute(exec('subagent', 0, { run_in_background: false }), next)
+  assert.equal(denied.kind, 'deny')
+  assert.match(denied.reason, /list_subagent_models/)
+  await readRoster(preExecute)
+  assert.equal(await preExecute(exec('subagent', 0, { run_in_background: false }), next), ALLOWED)
+  assert.match(mounted.sections[0].text(), /用人两步走/, '表没了，提示段也回到侦察版')
 })

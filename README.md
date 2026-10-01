@@ -17,7 +17,7 @@
 
 ## English summary
 
-A DSH (DeepSeek Harness) plugin bundle that declares two agent presets in which the top-level agent does no work itself. Every non-management tool call (`read`, `write`, `pwsh`, `web_search`, `workflow`, `skill`, …) is **denied at the harness boundary**, so the task has to go to a subagent; the first delegation of a session must run in the foreground, and a further delegation is refused while one is in flight. The prompt has the leader spend one web-research pass on the available subagent models, then name the chosen provider and model in each delegation. A second preset, `outsourcing-expert-reverse`, deliberately picks weaker models for harder tasks.
+A DSH (DeepSeek Harness) plugin bundle that declares two agent presets in which the top-level agent does no work itself. Every non-management tool call (`read`, `write`, `pwsh`, `web_search`, `workflow`, `skill`, …) is **denied at the harness boundary**, so the task has to go to a subagent, and the chosen provider and model have to be named in each delegation. Before the first delegation the leader must look up the available subagent models and research them once; that research is cached at `<DSH_HOME>/outsourcing-expert/models.md` and inlined into the system prompt from then on, so later sessions skip it entirely — while no cache exists, a delegation without a roster lookup, or a first delegation not run in the foreground, is refused at the harness boundary. A second preset, `outsourcing-expert-reverse`, deliberately picks weaker models for harder tasks.
 
 Install: `dsh plugin --profile <profile> add github:Funny1Potato/dsh-outsourcing-expert`, then start a new session and pick 外包高手. Only the two presets this bundle declares are affected; other presets are untouched.
 
@@ -50,16 +50,32 @@ Install: `dsh plugin --profile <profile> add github:Funny1Potato/dsh-outsourcing
 - **能力表不外露**：第一轮侦察得到的能力表只作为自己的选人依据，**不展示给用户**。
 - **理由只讲一次**：在委派那一刻说明（可选）；**交付最终结果时不再重复**。
 
-### 3. 用人两步走
+### 3. 用人：先侦察（只做一次），再按能力表派活
 
-1. **第一轮（每个会话一次）——侦察候选模型的能力**
+1. **第一轮（本机没有缓存时）——侦察候选模型的能力**
    - 调 `list_subagent_models` 拿到**完整的授权模型名册**（无参数列 provider，再按 provider 列模型）；
    - 从名册里**随机挑一个**模型当「侦察兵」（不挑「看起来最强」的）；
    - 用 `subagent` 显式指定这个模型，并传 `run_in_background: false`（下一步依赖它的结果），把**完整名册**贴进委派提示，要求它用 `web_search` 逐个查「擅长什么、适合哪类任务、评测口碑如何」并附来源，按固定格式返回一张**能力表**；
    - 名册拿不到时**不要瞎猜**：跳过侦察、省略 `provider`/`model` 交给默认路线。
-   - **顺序是代码强制的**：这一条委派必须是**前台**（`run_in_background: false`），且那一刻**不许**同时派别的活——默认后台、或把侦查和干活并行发出，都会被当场拒绝并附上改法。
+   - **顺序是代码强制的**：必须**先查名册**才准发第一条委派，而且那一条必须是**前台**（`run_in_background: false`）、那一刻**不许**同时派别的活——跳过名册、默认后台、或把侦查和干活并行发出，都会被当场拒绝并附上改法。
+   - **侦察结果由插件自动落盘**（见下方「能力表缓存」）：之后**所有会话都不再侦察**，这条流程只走一次。
 2. **之后每一轮——按能力表外包**：判任务难度 → 从能力表里选人（只能在表内选，绝不编造模型名）→ **选定的模型要显式传给 `subagent`**（`provider` + `model`，必要时带 `reasoning_effort`）**并按 `<provider>/<model>：<任务>` 的格式写进 `description`**（不写进调用参数就等于没选，卡片上也看不到）→ 失败可升级重试一次。
    查不到的模型用名称启发式补上并标注「未核实」：`flash/lite/mini/small`=轻量快速，`standard/medium`=均衡，`coder/code`=代码专精，`pro/max/ultra/thinking/reasoner`=旗舰强推理，无法归类=均衡。
+
+### 3.5 能力表缓存（侦察一次，之后所有会话直接用）
+
+「这些模型各自擅长什么」是这台机器的属性，与会话、工作区无关，却要花一次联网搜索才能得到——所以侦察成功后插件就把表写下来，之后直接把表**内联进系统提示段**。
+
+| 项 | 值 |
+| --- | --- |
+| 位置 | `<DSH_HOME>/outsourcing-expert/models.md`（`$DSH_HOME` 未设时即 `~/.dsh`；可用配置项 `storeDir` 改） |
+| 格式 | 首行是 `<!-- dsh-outsourcing-expert {...} -->` 元信息注释，其余是能力表正文；**手工编辑没问题**，首行缺失时整个文件都算正文 |
+| 写入时机 | **只在本机没有表时写**。已有表时永不自动覆盖——想换新表就 `/outsourcing-models-clear` 或直接删文件 |
+| 体检 | 侦察结果要「像一张能力表」（≥2 行含 `provider/model`，且出现能力档位词）才会被写；不像就不写，宁缺勿脏 |
+| 上限 | 正文约 6000 字符，超出按码点安全截断（它会进每次请求的系统提示） |
+| 命令 | `/outsourcing-models` 看（路径、更新时间、来源、正文）｜`/outsourcing-models-clear` 清空｜`/outsourcing-models-init` 清空**并让当前会话重新侦察一次** |
+
+缓存存在时，提示段换成「直接用表」的版本（表正文附在末尾），并且**两道代码门一起取消**——它们只为保证侦察真的发生，没有侦察要做时就不该再要求前台与名册。两个 preset 共用同一份缓存（缓存的是一致的事实，不是用人规则）。
 
 ### 4. 定目标必须先问下属
 
@@ -71,12 +87,13 @@ Install: `dsh plugin --profile <profile> add github:Funny1Potato/dsh-outsourcing
 
 ### 6. 顺序纪律（代码强制，不只是提示）
 
-提示里写「第一轮必须前台、必须单独一轮」实测会被无视（`subagent` 在 continuable 实例上**默认后台运行**），于是模型会把侦查和干活在同一轮里一起发出去、等不到能力表。所以在代码上兜了两道：
+提示里写「第一轮必须前台、必须单独一轮」实测会被无视（`subagent` 在 continuable 实例上**默认后台运行**），于是模型会把侦查和干活在同一轮里一起发出去、等不到能力表。所以在代码上兜了三道（**都只在「本机还没有能力表缓存」时生效**）：
 
-1. **每条会话的第一条委派必须是前台**（`run_in_background: false`）——那一条就是第一轮侦查；默认后台会被拒绝，并附上改法。
-2. **有前台委派在飞时，新的委派一律拒绝**——「侦查和干活同时发出」这条路径被堵死。后台委派不受这条限制，所以后续「并行优先」照旧。
+1. **没查过名册就不能委派**——先调 `list_subagent_models`。少了这一道，模型会直接派活，侦察永远不发生、缓存也就永远是空的。
+2. **第一条委派必须是前台**（`run_in_background: false`）——那一条就是侦察；默认后台会被拒绝，并附上改法。
+3. **有前台委派在飞时，新的委派一律拒绝**——「侦查和干活同时发出」这条路径被堵死。后台委派不受这条限制，所以后续「并行优先」照旧。
 
-状态只用「同一调用的 `pre-execute` / `post-execute` 配对」置位与清位（`post-execute` 连抛错的工具都会收到），再加 `agent/pre-step` 兜底（新的一步开始就说明上一轮已结束），两道保险保证**不会把领导永久锁死**。若某个 preset 的委派工具没暴露 `run_in_background`，第 1 道规则自动跳过（否则同样会锁死）。
+第 1 道在「名册工具不在本 preset 的 schema 里」时自动跳过，第 2 道在「委派工具没暴露 `run_in_background`」时自动跳过（否则都会锁死）。状态只用「同一调用的 `pre-execute` / `post-execute` 配对」置位与清位（`post-execute` 连抛错的工具都会收到），再加 `agent/pre-step` 兜底（新的一步开始就说明上一轮已结束），两道保险保证**不会把领导永久锁死**。
 
 ### 7. 子会话标题＝「模型 · 任务」（宿主侧自动写，不依赖模型）
 
@@ -108,7 +125,7 @@ Desktop 端的 profile 由应用独占管理，装插件走界面（**插件 →
 | 文件 | 作用 |
 | --- | --- |
 | `cordis.patch.yml` | 唯一的 patch 层：插入两条 `@deepseek-ai/dsh-agent-preset` 声明。两份花名册都以官方 standard preset 为底（原样照抄），只差最后那行插件的 `reverseHiring`——**改花名册时两处一起改** |
-| `src/index.js` | 可执行半侧：拦截 + 纪律段（两个 preset 共用同一份代码） |
+| `src/index.js` | 可执行半侧：拦截、顺序纪律、纪律段、能力表缓存的读写与三条 `/outsourcing-models*` 命令（两个 preset 共用同一份代码） |
 | `tests/contract.test.mjs` | 契约测试（记录型 ctx 桩，不依赖宿主） |
 | `LICENSE` | MIT |
 
@@ -119,17 +136,21 @@ Desktop 端的 profile 由应用独占管理，装插件走界面（**插件 →
 | `allowTools` | `string[]` | **追加**到内置白名单的工具名（只能加，不能减） |
 | `reverseHiring` | `bool` | `false`=能力对齐，`true`=反向用人。**两个 preset 唯一的差别** |
 | `escalateOnFailure` | `bool` | 失败后是否允许升级模型重试一次（提示层规则） |
+| `capabilityCache` | `bool` | 默认 `true`。`false` = 不读写能力表缓存，退回「每个会话各自侦察一次」（两道代码门仍在） |
+| `storeDir` | `string` | 缓存目录（放着 `models.md` 的那个目录）。默认 `<DSH_HOME>/outsourcing-expert` |
 
 ## 开发与验证
 
 ```sh
-node --test        # 契约测试：导出形状、提示段字段、拒绝形状、白名单、子 Agent 判据、两个 preset 的规则差异、说话方式文案
+node --test        # 契约测试：导出形状、提示段字段、拒绝形状、白名单、子 Agent 判据、两个 preset 的规则差异、说话方式文案、能力表缓存的读写与两道门
 ```
 
 ## 已知限制
 
 - **硬拦截意味着领导只能问、只能拆、只能委派**，不能自己动手。想退化成纯提示词模式，把 `src/index.js` 里 `tools/pre-execute` 的 `return { kind: 'deny', ... }` 改成 `return next()` 即可。
-- **第一轮侦察要花一次联网搜索**（每个会话一次），能力表只活在当前会话的上下文里，没有落盘复用；换会话要重新侦察。
+- **第一轮侦察只需一次**（本机没有缓存时），之后走缓存。但缓存的**质量取决于那一次侦察兵**：它是模型写的表，可能不准；而且换 provider / 加模型后表会过时——`/outsourcing-models-init` 清掉并当场重新侦察。
+- **缓存是机器级全局的一份**（`AssembleContext` 只给 `{ scope, signal }`，拿不到会话与工作区，所以也只能是全局）。同一台机器上的所有工作区、两个 preset 共用它。
+- **侦察结果格式不达标就不会被缓存**：体检要求「≥2 行含 `provider/model` 且出现能力档位词」。达不到就只是这一次会话没有表，下个会话还得重来（不会写坏缓存）。
 - **选人规则是提示层，不是运行时强制**。宿主的 `tools/pre-execute` **明确排除「改写参数」**（参数此刻已记入日志并展示给用户），插件无法在派发前替领导把 `provider` / `model` 改掉。要真正做到「插件接管选人」，得自己注册一个委派工具并用 `ctx.subagents.start({ agentOptions })` 固定路由——那是另一套实现。
 - **两个 preset 都是 native 工具模式**，不涉及 PTC。若拿这份花名册去搭 ptc preset，记得把 `run_code` 加进 `allowTools`（否则领导的唯一原生入口也被拦掉）。
 - **运行中的会话不会自动拿到新配置**：改代码或 `cordis.patch.yml` 后需重启 host（或在插件页停用再启用）；已存在的会话保持它创建时的 preset 组合，要**新建会话**才生效。

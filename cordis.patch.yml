@@ -191,6 +191,10 @@
               reverseHiring: false
               # 子任务失败后是否允许升级模型重试一次。
               escalateOnFailure: true
+              # 能力表缓存：侦察一次后写到 <DSH_HOME>/outsourcing-expert/models.md，
+              # 之后所有会话直接把表内联进提示段用、不再侦察（表只在空的时候写入）。
+              # 关掉它就退回「每个会话各自侦察一次」的老行为。
+              capabilityCache: true
     # ====================================================================
     # preset 2：「外包高手（反向用人）」（越难越用弱模型）
     # 花名册与 preset 1 逐行相同，只有最后那行插件的 reverseHiring 不同。
@@ -349,3 +353,5 @@
               # 反向用人：越难的任务故意用越弱的模型，越简单故意用越强的模型。
               reverseHiring: true
               escalateOnFailure: true
+              # 与 preset 1 共用同一份能力表缓存（缓存是机器级的，与工作区、用人规则无关）。
+              capabilityCache: true
