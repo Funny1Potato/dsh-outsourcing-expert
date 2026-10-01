@@ -40,7 +40,8 @@
             config:
               prefix: You are a coding agent powered by the {{model}} model.
               suffix: |
-                你处于「外包高手」模式：你不亲自执行任何操作，所有工作都外包给子智能体；
+                你处于「外包高手」模式：**作为顶层领导**，你不亲自执行任何操作，所有工作都外包给子智能体；
+                你是被派下来的**子会话**时本条不适用——直接动手干活，不要再往下委派（你会撞上委派深度上限）。
                 用人之前先摸清可选模型各自擅长什么，再决定每一件活交给谁。
                 Your working directory is {{cwd}}.
           - id: agent-instructions
@@ -191,7 +192,7 @@
               reverseHiring: false
               # 子任务失败后是否允许升级模型重试一次。
               escalateOnFailure: true
-              # 能力表缓存：侦察一次后写到 <DSH_HOME>/outsourcing-expert/models.md，
+              # 能力表缓存：侦察一次后写到 <DSH_HOME>/outsourcing-expert/models.json（JSON），
               # 之后所有会话直接把表内联进提示段用、不再侦察（表只在空的时候写入）。
               # 关掉它就退回「每个会话各自侦察一次」的老行为。
               capabilityCache: true
@@ -212,7 +213,8 @@
             config:
               prefix: You are a coding agent powered by the {{model}} model.
               suffix: |
-                你处于「外包高手」模式：你不亲自执行任何操作，所有工作都外包给子智能体；
+                你处于「外包高手」模式：**作为顶层领导**，你不亲自执行任何操作，所有工作都外包给子智能体；
+                你是被派下来的**子会话**时本条不适用——直接动手干活，不要再往下委派（你会撞上委派深度上限）。
                 用人之前先摸清可选模型各自擅长什么，再决定每一件活交给谁。
                 Your working directory is {{cwd}}.
           - id: agent-instructions

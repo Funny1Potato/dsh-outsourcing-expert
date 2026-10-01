@@ -40,7 +40,7 @@ after(() => {
  * 「先查名册」那道门会自己让开、不会把领导锁死。
  *
  * 每个桩都会拿到一个**独立的临时缓存目录**（config.storeDir），因为能力表缓存是按路径
- * 读写的——不隔离的话测试会去读真机上的 `~/.dsh/outsourcing-expert/models.md`。
+ * 读写的——不隔离的话测试会去读真机上的 `~/.dsh/outsourcing-expert/models.json`。
  */
 function mount(config, options = {}) {
   const { exposeBackgroundFlag = true, exposeRosterTool = true } = options
@@ -97,17 +97,25 @@ function mount(config, options = {}) {
   return { listeners, sections, tools, commands, renames, children, listener, command, storeDir }
 }
 
-/** 缓存文件路径（与插件内部约定一致：storeDir/models.md）。 */
-const cacheFile = (storeDir) => join(storeDir, 'models.md')
+/** 缓存文件路径（与插件内部约定一致：storeDir/models.json，JSON 格式）。 */
+const cacheFile = (storeDir) => join(storeDir, 'models.json')
 
-/** 直接写一份缓存，模拟「之前某次会话已经侦察过」。 */
+/** 旧格式缓存文件路径（markdown，只读兼容）。 */
+const legacyCacheFile = (storeDir) => join(storeDir, 'models.md')
+
+/**
+ * 直接写一份缓存，模拟「之前某次会话已经侦察过」。默认写结构化 `raw`（新 JSON 格式）；
+ * 想测结构化分支就在 `meta` 里传 `models`。
+ */
 function seedCache(storeDir, body, meta = {}) {
   mkdirSync(storeDir, { recursive: true })
-  writeFileSync(
-    cacheFile(storeDir),
-    `<!-- dsh-outsourcing-expert ${JSON.stringify({ updatedAt: '2026-10-01T00:00:00.000Z', ...meta })} -->\n${body}\n`,
-    'utf8',
-  )
+  const payload = {
+    updatedAt: '2026-10-01T00:00:00.000Z',
+    source: '子智能体侦察（x / mimo）',
+    ...meta,
+  }
+  if (payload.models === undefined && payload.raw === undefined) payload.raw = body
+  writeFileSync(cacheFile(storeDir), `${JSON.stringify(payload, null, 2)}\n`, 'utf8')
 }
 
 /** 一份通过体检（≥2 行 provider/model + 档位词）的能力表文本。 */
@@ -181,6 +189,27 @@ test('提示段用 text 字段、关掉变量插值，且正文可渲染', () =>
   // 选定的模型必须落到调用参数上（selection 与 description 两处），否则卡片只会显示「未指定」。
   assert.match(text, /选定后要显式传给\s*`subagent`/)
   assert.match(text, /把它写进\s*`description`/)
+})
+
+test('子会话拿不到领导纪律段（否则侦察兵也会去派子智能体撞委派深度上限）', () => {
+  const { sections } = mount({})
+  const section = sections[0]
+
+  // 领导（顶层会话）：正常拿到全文
+  const leader = { session: { id: 'leader-1', header: { delegationDepth: 0 } } }
+  assert.ok(section.text({ agent: leader, scope: leader }).length > 0, '领导要拿到全文')
+
+  // 子会话（origin 标记或深度标记任一命中）：返回空串 → renderPrompt 会把空段丢掉
+  for (const child of [
+    { session: { id: 'child-1', header: { origin: 'subagent' } } },
+    { session: { id: 'child-2', header: { delegationDepth: 1 } } },
+  ]) {
+    assert.equal(section.text({ agent: child, scope: child }), '', '子会话不该拿到领导纪律')
+  }
+
+  // 拿不准（没有上下文 / 读不到会话头）时按领导处理：宁可多给也不要漏给
+  assert.ok(section.text().length > 0, '空上下文按领导处理')
+  assert.ok(section.text({ agent: {} }).length > 0, '没有会话头也按领导处理')
 })
 
 test('纪律段：不自述过程、能力表不外露、理由只讲一次、模型名写进 description', () => {
@@ -534,10 +563,13 @@ test('能力表缓存：侦察结果自动落盘，之后提示段换成「直�
     { isError: false, content: [{ type: 'text', text: CAPABILITY_TABLE }] },
     nextPost,
   )
-  const written = readFileSync(cacheFile(mounted.storeDir), 'utf8')
-  assert.match(written, /^<!-- dsh-outsourcing-expert \{"updatedAt":"/, '首行是元信息注释')
-  assert.match(written, /deepseek-account\/deepseek-v4-pro/)
-  assert.match(written, /"source":"子智能体侦察（x \/ mimo）"/, '元信息里记下是哪条侦察得到的')
+  const written = JSON.parse(readFileSync(cacheFile(mounted.storeDir), 'utf8'))
+  assert.equal(typeof written.updatedAt, 'string', 'JSON 必须带更新时间')
+  assert.equal(written.source, '子智能体侦察（x / mimo）', '记下是哪条侦察得到的')
+  // 结构化是常态：按表头解析出的 models 数组（不是一坨 markdown）
+  assert.ok(Array.isArray(written.models) && written.models.length >= 2, '应解析成结构化 models 数组')
+  assert.equal(written.models[1].model, 'xiaomi-tp/mimo-v2.6-flash')
+  assert.equal(written.models[0].tier, '旗舰强推理')
 
   // 提示段换成「直接用表」：不再侦察，表正文内联进来
   const text = mounted.sections[0].text()
@@ -600,6 +632,51 @@ test('侦察结果不像能力表就不写缓存（宁缺勿脏）', async () =>
   assert.ok(!existsSync(cacheFile(second.storeDir)), '失败的结果不该写进缓存')
 })
 
+test('第一条侦察结果不像能力表时不消费标记，第二条合格的仍能落盘', async () => {
+  const mounted = mount({})
+  const preExecute = mounted.listener('tools/pre-execute')
+  const postExecute = mounted.listener('tools/post-execute')
+  const broken = { isError: false, content: [{ type: 'text', text: '无法完成联网调研：subagent depth 2 exceeds maxDepth 1' }] }
+  const table = { isError: false, content: [{ type: 'text', text: CAPABILITY_TABLE }] }
+
+  await readRoster(preExecute)
+
+  // ① 第一条（前台）＝侦察，结果不像能力表 → 不写，但标记要留着
+  await preExecute(exec('subagent', 0, { run_in_background: false }), next)
+  await postExecute(exec('subagent', 0, { run_in_background: false }), broken, nextPost)
+  assert.ok(!existsSync(cacheFile(mounted.storeDir)), '不像能力表就不该写')
+
+  // ② 第二条（后台）＝重侦察，结果是合格能力表 → 这次必须写进去
+  await preExecute(exec('subagent', 0, { run_in_background: true }), next)
+  await postExecute(exec('subagent', 0, { run_in_background: true }), table, nextPost)
+  assert.ok(existsSync(cacheFile(mounted.storeDir)), '第二条合格的结果应被缓存——实测漏掉的就是它')
+  assert.match(readFileSync(cacheFile(mounted.storeDir), 'utf8'), /deepseek-account\/deepseek-v4-pro/)
+})
+
+test('连续多次不像能力表就放弃本会话（标记不能无限挂着）', async () => {
+  const mounted = mount({})
+  const preExecute = mounted.listener('tools/pre-execute')
+  const postExecute = mounted.listener('tools/post-execute')
+  const broken = { isError: false, content: [{ type: 'text', text: '没查到，交不了表' }] }
+  const table = { isError: false, content: [{ type: 'text', text: CAPABILITY_TABLE }] }
+
+  await readRoster(preExecute)
+  await preExecute(exec('subagent', 0, { run_in_background: false }), next)
+  await postExecute(exec('subagent', 0, { run_in_background: false }), broken, nextPost)
+
+  // 第 2、3 次仍不像表 → 计数到 MAX_RECON_TRIES（3）就丢标记
+  for (const fg of [true, false]) {
+    await preExecute(exec('subagent', 0, { run_in_background: fg }), next)
+    await postExecute(exec('subagent', 0, { run_in_background: fg }), broken, nextPost)
+  }
+  assert.ok(!existsSync(cacheFile(mounted.storeDir)))
+
+  // 标记已丢：即使这次交出真表也不写（防止一条远处的委派被误当成侦察）
+  await preExecute(exec('subagent', 0, { run_in_background: true }), next)
+  await postExecute(exec('subagent', 0, { run_in_background: true }), table, nextPost)
+  assert.ok(!existsSync(cacheFile(mounted.storeDir)), '放弃之后不应再写')
+})
+
 test('边界：没有 list_subagent_models 时那道门让开；capabilityCache: false 退回每会话侦察', async () => {
   // 组合里没有名册工具 → 不拦（否则就是把人锁死）
   const noRoster = mount({}, { exposeRosterTool: false })
@@ -633,7 +710,7 @@ test('三条命令：看 / 清空 / 初始化（手写文件也认）', () => {
   const empty = show()
   assert.equal(empty.kind, 'success')
   assert.match(empty.text, /还没有能力表缓存/)
-  assert.match(empty.text, /models\.md/)
+  assert.match(empty.text, /models\.json/)
 
   seedCache(mounted.storeDir, CAPABILITY_TABLE)
   const shown = show()
@@ -641,8 +718,9 @@ test('三条命令：看 / 清空 / 初始化（手写文件也认）', () => {
   assert.match(shown.text, /更新：2026-10-01T00:00:00\.000Z/)
   assert.match(shown.text, /deepseek-account\/deepseek-v4-pro/)
 
-  // 手工写的文件没有首行元信息：整个文件都算正文，时间显示为未知
-  writeFileSync(cacheFile(mounted.storeDir), CAPABILITY_TABLE, 'utf8')
+  // 手工写的老格式（markdown、没有首行元信息）也要认：先移开 JSON，只留老文件
+  rmSync(cacheFile(mounted.storeDir), { force: true })
+  writeFileSync(legacyCacheFile(mounted.storeDir), CAPABILITY_TABLE, 'utf8')
   assert.match(show().text, /更新：未知/)
   assert.match(mounted.sections[0].text(), /本机缓存的能力表（未知）/)
 
@@ -651,7 +729,8 @@ test('三条命令：看 / 清空 / 初始化（手写文件也认）', () => {
   assert.match(cleared.text, /已清空/)
   // 清空只说「下一条新会话会重新侦察」，要连当前会话一起重来得用 init——文案里要指过去。
   assert.match(cleared.text, /outsourcing-models-init/)
-  assert.ok(!existsSync(cacheFile(mounted.storeDir)))
+  assert.ok(!existsSync(cacheFile(mounted.storeDir)), 'JSON 那份应被删')
+  assert.ok(!existsSync(legacyCacheFile(mounted.storeDir)), '老 markdown 那份也要被删')
   assert.match(show().text, /还没有能力表缓存/)
 })
 

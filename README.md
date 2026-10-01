@@ -13,7 +13,7 @@
 
 ## English summary
 
-A DSH (DeepSeek Harness) plugin bundle that declares two agent presets in which the top-level agent does no work itself. Every non-management tool call (`read`, `write`, `pwsh`, `web_search`, `workflow`, `skill`, …) is **denied at the harness boundary**, so the task has to go to a subagent, and the chosen provider and model have to be named in each delegation. Before the first delegation the leader must look up the available subagent models and research them once; that research is cached at `<DSH_HOME>/outsourcing-expert/models.md` and inlined into the system prompt from then on, so later sessions skip it entirely — while no cache exists, a delegation without a roster lookup, or a first delegation not run in the foreground, is refused at the harness boundary. A second preset, `outsourcing-expert-reverse`, deliberately picks the model least suited to the task.
+A DSH (DeepSeek Harness) plugin bundle that declares two agent presets in which the top-level agent does no work itself. Every non-management tool call (`read`, `write`, `pwsh`, `web_search`, `workflow`, `skill`, …) is **denied at the harness boundary**, so the task has to go to a subagent, and the chosen provider and model have to be named in each delegation. Before the first delegation the leader must look up the available subagent models and research them once; that research is cached at `<DSH_HOME>/outsourcing-expert/models.json` and inlined into the system prompt from then on, so later sessions skip it entirely — while no cache exists, a delegation without a roster lookup, or a first delegation not run in the foreground, is refused at the harness boundary. A second preset, `outsourcing-expert-reverse`, deliberately picks the model least suited to the task.
 
 Install: `dsh plugin --profile <profile> add github:Funny1Potato/dsh-outsourcing-expert`, then start a new session and pick 外包高手. Only the two presets this bundle declares are affected; other presets are untouched.
 
@@ -32,7 +32,7 @@ Install: `dsh plugin --profile <profile> add github:Funny1Potato/dsh-outsourcing
 | 委派 | `subagent`、`subagent_fork` |
 | 照看下属 | `list_subagent_models`、`list_agents`、`send_message`、`interrupt_agent` |
 
-**子 Agent 免检**：判据是会话头 `origin === 'subagent'` 或 `delegationDepth > 0`——宿主自己就是用这个字段区分顶层会话与子会话的。所以直接子 Agent、孙子 Agent、`workflow` 与 teammate 派生的子 Agent 都照常干活，resume 后依然成立。宿主内部不带 agent 的调用也放行。
+**子 Agent 免检**：判据是会话头 `origin === 'subagent'` 或 `delegationDepth > 0`——宿主自己就是用这个字段区分顶层会话与子会话的。所以直接子 Agent、孙子 Agent、`workflow` 与 teammate 派生的子 Agent 都照常干活，resume 后依然成立。宿主内部不带 agent 的调用也放行。**同一套纪律段也只发给顶层领导**（子会话装配时拿到空段）——否则侦察兵会照着「结论不由你产出、外包给子智能体」去派它自己的子智能体，撞委派深度上限、交不回表；persona 里同样写明了「子会话不适用」。
 
 ### 2. 说话方式（提示层）
 
@@ -52,7 +52,7 @@ Install: `dsh plugin --profile <profile> add github:Funny1Potato/dsh-outsourcing
 1. **第一轮（本机没有缓存时）——侦察候选模型的能力**
    - 调 `list_subagent_models` 拿到**完整的授权模型名册**（无参数列 provider，再按 provider 列模型）；
    - 从名册里**随机挑一个**模型当「侦察兵」（不挑「看起来最强」的）；
-   - 用 `subagent` 显式指定这个模型，并传 `run_in_background: false`（下一步依赖它的结果），把**完整名册**贴进委派提示，要求它用 `web_search` 逐个查「擅长什么、适合哪类任务、评测口碑如何」并附来源，按固定格式返回一张**能力表**；
+   - 用 `subagent` 显式指定这个模型，并传 `run_in_background: false`（下一步依赖它的结果），把**完整名册**贴进委派提示，要求它**自己**用 `web_search` 逐个查「擅长什么、适合哪类任务、评测口碑如何」并附来源，按固定格式返回一张**能力表**（别让它再往下委派——它在深度上限，再派会被系统拒）；
    - 名册拿不到时**不要瞎猜**：跳过侦察、省略 `provider`/`model` 交给默认路线。
    - **顺序是代码强制的**：必须**先查名册**才准发第一条委派，而且那一条必须是**前台**（`run_in_background: false`）、那一刻**不许**同时派别的活——跳过名册、默认后台、或把侦查和干活并行发出，都会被当场拒绝并附上改法。
    - **侦察结果由插件自动落盘**（见下方「能力表缓存」）：之后**所有会话都不再侦察**，这条流程只走一次。
@@ -65,10 +65,10 @@ Install: `dsh plugin --profile <profile> add github:Funny1Potato/dsh-outsourcing
 
 | 项 | 值 |
 | --- | --- |
-| 位置 | `<DSH_HOME>/outsourcing-expert/models.md`（`$DSH_HOME` 未设时即 `~/.dsh`；可用配置项 `storeDir` 改） |
-| 格式 | 首行是 `<!-- dsh-outsourcing-expert {...} -->` 元信息注释，其余是能力表正文；**手工编辑没问题**，首行缺失时整个文件都算正文 |
+| 位置 | `<DSH_HOME>/outsourcing-expert/models.json`（`$DSH_HOME` 未设时即 `~/.dsh`；可用配置项 `storeDir` 改） |
+| 格式 | **JSON**（`models.json`）：`updatedAt` / `source`，正文要么是 `models`（按表头解析出的结构化数组：model / tier / 擅长 / 不适合 / 来源），要么是 `raw`（解析不出结构时的原文兜底）——两种都是 JSON，**手工编辑也没问题**。老 `models.md` 仍可读（只读兼容），下次写入自动转成 JSON 并删掉它 |
 | 写入时机 | **只在本机没有表时写**。已有表时永不自动覆盖——想换新表就 `/outsourcing-models-clear` 或直接删文件 |
-| 体检 | 侦察结果要「像一张能力表」（≥2 行含 `provider/model`，且出现能力档位词）才会被写；不像就不写，宁缺勿脏 |
+| 体检 | 侦察结果要「像一张能力表」（≥2 行含 `provider/model`，且出现能力档位词）才会被写；不像就不写，宁缺勿脏。**标记只在真的写进去时才消费**——第一条侦察翻车后，本会话后面那次合格的表照样能落盘（连续 3 次都不像才放弃本会话） |
 | 上限 | 正文约 6000 字符，超出按码点安全截断（它会进每次请求的系统提示） |
 | 命令 | `/outsourcing-models` 看（路径、更新时间、来源、正文）｜`/outsourcing-models-clear` 清空｜`/outsourcing-models-init` 清空**并让当前会话重新侦察一次** |
 
@@ -115,7 +115,7 @@ Desktop 端的 profile 由应用独占管理，装插件走界面（**插件 →
 | `reverseHiring` | `bool` | `false`=按类型与难度挑最合适的，`true`=照「不适合什么」挑最不合适的。**两个 preset 唯一的差别** |
 | `escalateOnFailure` | `bool` | 失败后是否允许升级模型重试一次（提示层规则） |
 | `capabilityCache` | `bool` | 默认 `true`。`false` = 不读写能力表缓存，退回「每个会话各自侦察一次」（两道代码门仍在） |
-| `storeDir` | `string` | 缓存目录（放着 `models.md` 的那个目录）。默认 `<DSH_HOME>/outsourcing-expert` |
+| `storeDir` | `string` | 缓存目录（放着 `models.json` 的那个目录）。默认 `<DSH_HOME>/outsourcing-expert` |
 
 ## 开发与验证
 

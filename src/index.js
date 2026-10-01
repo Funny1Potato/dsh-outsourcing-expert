@@ -16,7 +16,7 @@
  * （只自己用、不展示给用户）之后，每一件活再按能力表 + 任务难度决定派给谁。
  *
  * **能力表缓存**：调研一次很贵（要联网搜一遍），而结果对这台机器上的每个会话都一样，
- * 所以侦察结果会由本插件自动写到 `<DSH_HOME>/outsourcing-expert/models.md`，之后所有会话
+ * 所以侦察结果会由本插件自动写到 `<DSH_HOME>/outsourcing-expert/models.json`，之后所有会话
  * 直接把表内联进提示段用，不再侦察。缓存存在时：
  *   - 提示段换成「直接用表」的版本（附上表正文）；
  *   - 代码里的「先查名册」「第一条必须前台」两道门随之取消——它们只为保证侦察真的发生。
@@ -102,13 +102,21 @@ const DELEGATION_TOOLS = new Set(['subagent', 'subagent_fork'])
 /** 名册工具：缓存为空时那道「先查名册再委派」的门靠它判定。 */
 const ROSTER_TOOL = 'list_subagent_models'
 
-/** 能力表缓存：目录名、文件名、首行元信息标记。 */
+/** 能力表缓存：目录名、新格式（JSON）文件名、旧格式（markdown，只读兼容）文件名。 */
 const CACHE_DIR_NAME = 'outsourcing-expert'
-const CACHE_FILENAME = 'models.md'
+const CACHE_FILENAME = 'models.json'
+const LEGACY_CACHE_FILENAME = 'models.md'
 const CACHE_MARKER = 'dsh-outsourcing-expert'
 
 /** 缓存正文上限（字符）。它会被内联进**每次请求**的系统提示，所以必须封顶。 */
 const MAX_TABLE_CHARS = 6000
+
+/**
+ * 一个会话里最多容几次「侦察结果不像能力表」。标记要**留到真的写进缓存为止**（否则第一条
+ * 翻车结果就会把后续那次合格的能力表挡在门外——实测踩过），但也不能无限挂着，超过这次数
+ * 就放弃本会话。
+ */
+const MAX_RECON_TRIES = 3
 
 /**
  * 能力档位词。用来判断一段侦察结果「像不像一张能力表」——不像就不写进缓存，
@@ -219,7 +227,7 @@ function expandHome(value) {
 }
 
 /**
- * 解析缓存目录。配置项 `storeDir` 就是「放着 models.md 的那个目录」，原样使用；
+ * 解析缓存目录。配置项 `storeDir` 就是「放着 models.json 的那个目录」，原样使用；
  * 不配置时按宿主 `@deepseek-ai/dsh-home-paths` 的 `resolveDshHome` 优先级取
  * `$DSH_HOME`（空白视为未设）→ `~/.dsh`，再拼 `outsourcing-expert`。
  * 这里内联实现是为了不给插件引入运行期依赖（顺带避开 peer 依赖版本范围那套坑）。
@@ -265,6 +273,75 @@ function looksLikeCapabilityTable(text) {
   return modelLines >= 2 && TIER_WORDS.some(word => text.includes(word))
 }
 
+/** 切 markdown 表格的一行：去掉首尾竖线，按 `|` 分格并去空白。 */
+function splitTableRow(line) {
+  return line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(cell => cell.trim())
+}
+
+/**
+ * 从侦察返回的 markdown 表里解析出结构化能力表。取第一个 `|` 开头的表格，按表头关键词
+ * 定位列；表头对不上、或正文不足两行就返回空数组——**结构化是常态，解析不出来就退回原文
+ * （存 JSON 的 `raw` 字段），绝不因为解析失败把整张表丢掉**。
+ * @param {string} text - 侦察返回的正文
+ * @returns {{ model: string, tier: string, strengths: string, weaknesses: string, sources: string }[]}
+ */
+function parseCapabilityTable(text) {
+  const lines = text.split(/\r?\n/)
+  const headerIndex = lines.findIndex(line => /^\s*\|/.test(line))
+  if (headerIndex < 0) return []
+  const header = splitTableRow(lines[headerIndex])
+  const locate = (patterns) => header.findIndex(cell => patterns.some(pattern => cell.includes(pattern)))
+  const indexProvider = locate(['provider'])
+  const indexModel = locate(['provider/model', 'provider / model', '模型', 'model'])
+  const indexTier = locate(['档位', 'tier'])
+  const indexStrengths = locate(['擅长'])
+  const indexWeaknesses = locate(['不适合'])
+  const indexSources = locate(['来源', 'source'])
+  if (indexModel < 0 || indexTier < 0) return []
+
+  const rows = []
+  for (let i = headerIndex + 1; i < lines.length; i++) {
+    const line = lines[i]
+    if (!/^\s*\|/.test(line)) break
+    const cells = splitTableRow(line)
+    // 分隔行（|---|---|）
+    if (cells.every(cell => /^:?-+:?$/.test(cell))) continue
+    const model = cells[indexModel] ?? ''
+    if (model === '') continue
+    // provider 与 model 分成两列时拼回去；同一列（`provider/model`）时不重复。
+    const provider = indexProvider >= 0 && indexProvider !== indexModel ? cells[indexProvider] ?? '' : ''
+    rows.push({
+      model: provider === '' ? model : `${provider}/${model}`,
+      tier: cells[indexTier] ?? '',
+      strengths: indexStrengths >= 0 ? cells[indexStrengths] ?? '' : '',
+      weaknesses: indexWeaknesses >= 0 ? cells[indexWeaknesses] ?? '' : '',
+      sources: indexSources >= 0 ? cells[indexSources] ?? '' : '',
+    })
+  }
+  return rows
+}
+
+/** 把结构化能力表渲染回 markdown 表——提示段与命令显示共用同一份渲染，避免两处不一致。 */
+function renderCapabilityRows(models) {
+  const cell = (value) => String(value).replace(/\|/g, '\\|')
+  const head = '| provider/model | 能力档位 | 擅长什么 | 不适合什么 | 来源 |\n| --- | --- | --- | --- | --- |'
+  const body = models
+    .map(row => `| ${cell(row.model)} | ${cell(row.tier)} | ${cell(row.strengths)} | ${cell(row.weaknesses)} | ${cell(row.sources)} |`)
+    .join('\n')
+  return `${head}\n${body}`
+}
+
+/**
+ * 缓存正文的渲染形式（提示段与 `outsourcing-models` 命令共用）：
+ * 结构化就渲染成表，否则（老格式 / 解析不出结构）用原文。
+ * @param {{ models?: unknown[], raw?: string }} cache
+ * @returns {string}
+ */
+function renderCache(cache) {
+  const models = Array.isArray(cache.models) ? cache.models : []
+  return models.length > 0 ? renderCapabilityRows(models) : (cache.raw ?? '')
+}
+
 /** 解析首行的元信息注释；手写的文件（没有这一行）返回 undefined。 */
 function parseCacheMeta(head) {
   const match = new RegExp(`^<!--\\s*${CACHE_MARKER}\\s*(\\{.*\\})\\s*-->$`).exec(head.trim())
@@ -284,50 +361,84 @@ function parseCacheMeta(head) {
  */
 function createStore(dir) {
   const file = join(dir, CACHE_FILENAME)
+  const legacyFile = join(dir, LEGACY_CACHE_FILENAME)
+
+  /** 老 markdown 格式（首行元信息注释 + 正文）——只读兼容，让人手里的旧缓存继续可用。 */
+  const readLegacy = () => {
+    let raw
+    try {
+      raw = readFileSync(legacyFile, 'utf8')
+    } catch {
+      return undefined
+    }
+    const newline = raw.indexOf('\n')
+    const head = newline === -1 ? raw : raw.slice(0, newline)
+    const meta = parseCacheMeta(head)
+    const body = (meta === undefined ? raw : newline === -1 ? '' : raw.slice(newline + 1)).trim()
+    if (body === '') return undefined
+    return {
+      raw: body,
+      ...typeof meta?.updatedAt === 'string' ? { updatedAt: meta.updatedAt } : {},
+      ...typeof meta?.source === 'string' ? { source: meta.source } : {},
+    }
+  }
+
   return {
     file,
     /**
-     * 读出缓存；文件不存在、读不了、或正文为空都返回 undefined（等价于「没有缓存」）。
-     * @returns {{ body: string, updatedAt?: string, source?: string } | undefined}
+     * 读出缓存：先读 JSON（`models` 优先、解析不出结构时用 `raw`），没有再退回老 markdown。
+     * 文件不存在、读不了、或正文为空都返回 undefined（等价于「没有缓存」）。
+     * @returns {{ models?: unknown[], raw?: string, updatedAt?: string, source?: string } | undefined}
      */
     read() {
-      let raw
       try {
-        raw = readFileSync(file, 'utf8')
+        const parsed = JSON.parse(readFileSync(file, 'utf8'))
+        if (parsed !== null && typeof parsed === 'object') {
+          const models = Array.isArray(parsed.models)
+            ? parsed.models.filter(row => row !== null && typeof row === 'object'
+              && typeof row.model === 'string' && typeof row.tier === 'string')
+            : []
+          const raw = typeof parsed.raw === 'string' ? parsed.raw.trim() : ''
+          if (models.length > 0 || raw !== '') {
+            return {
+              ...models.length > 0 ? { models } : {},
+              ...raw !== '' ? { raw } : {},
+              ...typeof parsed.updatedAt === 'string' ? { updatedAt: parsed.updatedAt } : {},
+              ...typeof parsed.source === 'string' ? { source: parsed.source } : {},
+            }
+          }
+        }
       } catch {
-        return undefined
+        // 损坏 / 不是 JSON → 当作没有，退回老格式看一眼
       }
-      const newline = raw.indexOf('\n')
-      const head = newline === -1 ? raw : raw.slice(0, newline)
-      const meta = parseCacheMeta(head)
-      const body = (meta === undefined ? raw : newline === -1 ? '' : raw.slice(newline + 1)).trim()
-      if (body === '') return undefined
-      return {
-        body,
-        ...typeof meta?.updatedAt === 'string' ? { updatedAt: meta.updatedAt } : {},
-        ...typeof meta?.source === 'string' ? { source: meta.source } : {},
-      }
+      return readLegacy()
     },
     /**
-     * 写入缓存（先写 `.tmp` 再改名，避免半截文件被读到）。
-     * @param {string} body - 能力表正文
+     * 写入缓存（JSON；先写 `.tmp` 再改名，避免半截文件被读到）。
+     * 能按表头解析出结构就存 `models` 数组，否则存 `raw` 原文——**两种都是 JSON**，
+     * 绝不因为解析失败丢掉整张表。写成功后顺手删掉老 markdown，免得两份互相打架。
+     * @param {string} text - 侦察返回的正文
      * @param {string} [source] - 供人看的来源说明
      */
-    write(body, source) {
-      const text = clampChars(body.trim(), MAX_TABLE_CHARS)
-      const meta = JSON.stringify({
+    write(text, source) {
+      const body = clampChars(text.trim(), MAX_TABLE_CHARS)
+      const models = parseCapabilityTable(body)
+      const payload = {
         updatedAt: new Date().toISOString(),
         ...source === undefined ? {} : { source },
-      })
+        ...(models.length >= 2 ? { models } : { raw: body }),
+      }
       mkdirSync(dir, { recursive: true })
       const temp = `${file}.tmp`
-      writeFileSync(temp, `<!-- ${CACHE_MARKER} ${meta} -->\n${text}\n`, 'utf8')
+      writeFileSync(temp, `${JSON.stringify(payload, null, 2)}\n`, 'utf8')
       renameSync(temp, file)
-      return { body: text, updatedAt: new Date().toISOString() }
+      rmSync(legacyFile, { force: true })
+      return payload
     },
-    /** 删掉缓存文件；不存在时静默成功。 */
+    /** 删掉缓存（新旧两份）；不存在时静默成功。 */
     clear() {
       rmSync(file, { force: true })
+      rmSync(legacyFile, { force: true })
     },
   }
 }
@@ -408,6 +519,8 @@ ${DELEGATION_FORMAT}
    - **这一轮必须传 \`run_in_background: false\`**——你的下一步（决定派谁）依赖它的结果，
      要当场等它返回；
    - 把**完整的可选模型清单**贴进委派提示——它看不到你手上的这份清单；
+   - 告诉它**自己用 \`web_search\` 查、不要再往下委派**——侦察兵已经到了委派深度上限
+     （上限随 dsh 客户端配置），再派一个子智能体会被系统拒绝，它就交不回能力表；
    - 要求它对清单里的每个模型用 \`web_search\` 查「擅长什么、适合哪类任务、评测/口碑如何」，
      并**附上来源链接**；
    - 要求它按固定格式返回一张**能力表**：每个模型一行，写清 provider/model、能力档位
@@ -440,7 +553,7 @@ ${hiringSteps(reverse, escalateOnFailure, true)}
 
 ## 本机缓存的能力表（${formatCacheDate(cache)}）
 
-${cache.body}`
+${renderCache(cache)}`
 }
 
 /** 交付前自检（两个分支共用，但「按上面第几条重试」跟着升级开关走）。 */
@@ -459,7 +572,7 @@ ${retry}你自己无法核验的部分（读文件、跑命令）只能靠「再
  * @param {boolean} reverse - 是否反向用人
  * @param {boolean} escalateOnFailure - 失败后是否允许升级模型重试一次
  * @param {() => string[]} allowList
- * @param {{ body: string, updatedAt?: string, source?: string } | undefined} cache - 当前缓存
+ * @param {{ models?: unknown[], raw?: string, updatedAt?: string, source?: string } | undefined} cache - 当前缓存
  * @returns {string}
  */
 function discipline(reverse, escalateOnFailure, allowList, cache) {
@@ -540,6 +653,8 @@ export function apply(ctx, config = {}) {
   const rosterRead = new Set()
   /** 待缓存的侦察：发起方 → 那条委派的模型路线（跑完就写进缓存）。 */
   const reconPending = new Map()
+  /** 发起方 → 已经试过几次「结果不像能力表」（配合 MAX_RECON_TRIES 用）。 */
+  const reconAttempts = new Map()
   /**
    * 待认领的委派：发起方 agent id → 队列（模型 + 任务）。
    *
@@ -584,18 +699,25 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  /** 把这次侦察结果写进缓存（正文不像能力表就不写——宁缺勿脏）。 */
+  /**
+   * 把这次侦察结果写进缓存。
+   * @param {string} route - 侦察那条委派的模型路线
+   * @param {unknown} result - 委派结果
+   * @returns {boolean} 真的写进去了才为 true——调用方据此决定要不要把「待缓存」标记消费掉
+   */
   const persistRecon = (route, result) => {
     const text = resultText(result)
     if (text === '' || !looksLikeCapabilityTable(text)) {
       ctx.logger?.debug?.('outsourcing-expert: 侦察结果不像能力表，未写入缓存')
-      return
+      return false
     }
     try {
       store.write(text, `子智能体侦察（${route}）`)
       ctx.logger?.debug?.(`outsourcing-expert: 能力表已缓存到 ${store.file}`)
+      return true
     } catch (error) {
       ctx.logger?.debug?.(`outsourcing-expert: 能力表写入失败：${String(error)}`)
+      return false
     }
   }
 
@@ -703,15 +825,29 @@ export function apply(ctx, config = {}) {
     const delegation = DELEGATION_TOOLS.has(exec?.name)
     if (agent !== undefined && delegation) foregroundInFlight.delete(agent.id)
 
-    // 侦察结果缓存：只有「空表时那条被标成侦察的委派」才会命中，而且要求它成功、
-    // 正文像能力表。失败就不写（表留着空，下个会话重来）。
+    // 侦察结果缓存：只有「空表时那条被标成侦察的委派」才会命中，而且要求它成功。
+    // 关键：**只有真的写进缓存才丢标记**——第一条结果不像能力表（侦察兵翻车、被深度上限
+    // 拒了…）时留着它，后面那次合格的能力表才不会被漏掉。实测踩过：16:13 清空后第一条
+    // 侦察返回「subagent depth 2 exceeds maxDepth 1」，第二次才交出真表，却因为标记已被
+    // 消费而一张都没存上。连续 MAX_RECON_TRIES 次都不像表，就放弃本会话，防止标记无限挂着。
     // 注意只有**前台**委派的结果里才有子智能体的产出（后台那条只带回执），而侦察按纪律
     // 本来就是前台，所以这里不会漏。
     if (agent !== undefined && delegation && !isSubagent(agent) && reconPending.has(agent.id)) {
       if (result?.isError !== true) {
         const route = reconPending.get(agent.id)
-        reconPending.delete(agent.id)
-        persistRecon(route, result)
+        if (persistRecon(route, result)) {
+          reconPending.delete(agent.id)
+          reconAttempts.delete(agent.id)
+        } else {
+          const tries = (reconAttempts.get(agent.id) ?? 0) + 1
+          if (tries >= MAX_RECON_TRIES) {
+            reconPending.delete(agent.id)
+            reconAttempts.delete(agent.id)
+            ctx.logger?.debug?.(`outsourcing-expert: 侦察连续 ${tries} 次不像能力表，本会话放弃缓存`)
+          } else {
+            reconAttempts.set(agent.id, tries)
+          }
+        }
       }
     }
 
@@ -737,7 +873,16 @@ export function apply(ctx, config = {}) {
     // 缓存正文是模型写的，可能含 `{{...}}` 字面量；宿主对 {{变量}} 是严格的
     // （未知引用直接抛错，打断整轮装配），所以这一段必须关掉插值。
     interpolate: false,
-    text: () => discipline(reverseHiring, escalateOnFailure, () => [...allowTools], readCache()),
+    // 子会话**不给**这套领导纪律：它们继承同一个 preset，把「结论不由你产出、所有工作都
+    // 外包给子智能体」也发给侦察兵，它就会去派自己的子智能体——撞委派深度上限、交不回表
+    // （实测：子会话返回 "subagent depth exceeds maxDepth"）。`AssembleContext` 的 `agent`
+    // 与 `scope` 都是 agent 对象本身（宿主 `assembleContextFor()` 就是这么拼的）；
+    // 拿不准（读不到头）时按领导处理，宁可多给也不要漏给。
+    text: (context = {}) => {
+      const agent = context.agent ?? context.scope
+      if (isSubagent(agent)) return ''
+      return discipline(reverseHiring, escalateOnFailure, () => [...allowTools], readCache())
+    },
   })
 
   // --- 3. 三条命令：看 / 清空 / 重新侦察 -----------------------------------
@@ -761,7 +906,7 @@ export function apply(ctx, config = {}) {
         return {
           kind: 'success',
           text: `路径：${store.file}\n更新：${cache.updatedAt ?? '未知'}\n`
-            + `来源：${cache.source ?? '未知'}\n\n${cache.body}`,
+            + `来源：${cache.source ?? '未知'}\n\n${renderCache(cache)}`,
         }
       },
     })
