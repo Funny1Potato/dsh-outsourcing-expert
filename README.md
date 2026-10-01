@@ -81,25 +81,6 @@ Install: `dsh plugin --profile <profile> add github:Funny1Potato/dsh-outsourcing
 
 子任务失败或明显没做好时，允许**换更高一档的模型重试一次**；第二次仍失败就停下来向用户汇报，不无限重试。
 
-### 6. 顺序纪律（代码强制，不只是提示）
-
-提示里写「第一轮必须前台、必须单独一轮」实测会被无视（`subagent` 在 continuable 实例上**默认后台运行**），于是模型会把侦查和干活在同一轮里一起发出去、等不到能力表。所以在代码上兜了三道（**都只在「本机还没有能力表缓存」时生效**）：
-
-1. **没查过名册就不能委派**——先调 `list_subagent_models`。少了这一道，模型会直接派活，侦察永远不发生、缓存也就永远是空的。
-2. **第一条委派必须是前台**（`run_in_background: false`）——那一条就是侦察；默认后台会被拒绝，并附上改法。
-3. **有前台委派在飞时，新的委派一律拒绝**——「侦查和干活同时发出」这条路径被堵死。后台委派不受这条限制，所以后续「并行优先」照旧。
-
-第 1 道在「名册工具不在本 preset 的 schema 里」时自动跳过，第 2 道在「委派工具没暴露 `run_in_background`」时自动跳过（否则都会锁死）。状态只用「同一调用的 `pre-execute` / `post-execute` 配对」置位与清位（`post-execute` 连抛错的工具都会收到），再加 `agent/pre-step` 兜底（新的一步开始就说明上一轮已结束），两道保险保证**不会把领导永久锁死**。
-
-### 7. 子会话标题＝「模型 · 任务」（宿主侧自动写，不依赖模型）
-
-每次委派成功后，插件把**子会话的标题**写成 `模型 · 任务`（模型在前；标题上限 80 字节，超了按码点安全截断、先丢任务）。实现走 `sessionTitle.rename`：
-
-- 它写一条持久化的 `session/title` 事件，并且**把标题钉住**——自动起名与兜底标题都不会再覆盖（源码注释：*"pins the title: in-flight automatic generation is superseded and later user messages schedule none"*）；子会话本来就**不会**排 LLM 自动起名（要求 `parentSession === undefined`）。
-- 于是在**子智能体头部 / 血缘导航 / 切换器 / 会话列表**里一眼就能看到这一条委派派给了谁，重启与回放后依然在。
-- 子会话 id 的来源：子会话出现时会发 `subagent/start`（带子会话 id），此刻它一定是活的；插件在放行委派时已把「模型 + 任务」记在发起方名下，这里按子会话头的 `parentSession` 反查发起方、认领并命名（跑起来的那条在 `start` 里被消费，**没跑起来的那条在委派结果里被丢弃**，否则会张冠李戴）。该事件是 scope 过滤派发的，插件挂在 preset scope 下面，**必须用 `{ global: true }` 才收得到**（副作用是同一事件会被投递两次，靠「认领即消费」天然去重）。
-- 全程**尽力而为**：拿不到 live 会话（例如远端子智能体）、服务缺失或 `rename` 抛错，都只记一条 debug 日志，绝不影响委派本身。
-
 ## 安装与启用
 
 从 GitHub 装（发布在 <https://github.com/Funny1Potato/dsh-outsourcing-expert>；包里没有 `prepare` / `build` 脚本，源码安装不需要 `allowBuilds` 授权）：
