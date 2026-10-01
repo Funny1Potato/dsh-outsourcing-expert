@@ -1,11 +1,11 @@
 # 外包高手（dsh-outsourcing-expert）
 
-一个 DSH 插件包：声明两个 agent preset，把「领导」变成**不亲自干活、把活全外包出去**的角色——先摸清可选模型各自擅长什么，再按任务难度决定每一件活交给谁。
+一个 DSH 插件包：声明两个 agent preset，把「领导」变成**不亲自干活、把活全外包出去**的角色——先摸清可选模型各自擅长什么，再按任务的难度与类型决定每一件活交给谁。
 
 | preset | id | 选人规则 |
 | --- | --- | --- |
-| **外包高手** | `outsourcing-expert` | 能力对齐：简单 →轻量快速，中等 →均衡，困难 →代码专精或强推理，极难 →旗舰强推理 |
-| **外包高手（独具慧眼）** | `outsourcing-expert-reverse` | 故意反着来：任务越难越用**弱**模型，越简单越用**强**模型 |
+| **外包高手** | `outsourcing-expert` | 能力对齐：先按**任务类型**挑「擅长」命中该类的模型，再按**难度**定档——简单 →轻量快速，中等 →均衡，困难 →代码专精或强推理，极难 →旗舰强推理 |
+| **外包高手（独具慧眼）** | `outsourcing-expert-reverse` | 故意反着来：照能力表「不适合什么」那栏挑，**专挑干不了这个任务**的模型 |
 
 两个 preset 只差插件行配置里的 `reverseHiring`；**没有运行时开关**，选哪个就是哪个。
 
@@ -13,7 +13,7 @@
 
 ## English summary
 
-A DSH (DeepSeek Harness) plugin bundle that declares two agent presets in which the top-level agent does no work itself. Every non-management tool call (`read`, `write`, `pwsh`, `web_search`, `workflow`, `skill`, …) is **denied at the harness boundary**, so the task has to go to a subagent, and the chosen provider and model have to be named in each delegation. Before the first delegation the leader must look up the available subagent models and research them once; that research is cached at `<DSH_HOME>/outsourcing-expert/models.md` and inlined into the system prompt from then on, so later sessions skip it entirely — while no cache exists, a delegation without a roster lookup, or a first delegation not run in the foreground, is refused at the harness boundary. A second preset, `outsourcing-expert-reverse`, deliberately picks weaker models for harder tasks.
+A DSH (DeepSeek Harness) plugin bundle that declares two agent presets in which the top-level agent does no work itself. Every non-management tool call (`read`, `write`, `pwsh`, `web_search`, `workflow`, `skill`, …) is **denied at the harness boundary**, so the task has to go to a subagent, and the chosen provider and model have to be named in each delegation. Before the first delegation the leader must look up the available subagent models and research them once; that research is cached at `<DSH_HOME>/outsourcing-expert/models.md` and inlined into the system prompt from then on, so later sessions skip it entirely — while no cache exists, a delegation without a roster lookup, or a first delegation not run in the foreground, is refused at the harness boundary. A second preset, `outsourcing-expert-reverse`, deliberately picks the model least suited to the task.
 
 Install: `dsh plugin --profile <profile> add github:Funny1Potato/dsh-outsourcing-expert`, then start a new session and pick 外包高手. Only the two presets this bundle declares are affected; other presets are untouched.
 
@@ -44,7 +44,8 @@ Install: `dsh plugin --profile <profile> add github:Funny1Potato/dsh-outsourcing
     之所以必须在最前面：界面折叠卡片只取结果里**第一个**非空文本块当预览（`ui-trajectory` 的 `summarizeResult`），追加在末尾就只有展开才看得见。
     这是插件在 `tools/post-execute` 里改写结果正文加上的（只换正文、**不动结构化 value**，所以后台委派的 subagentId 之类照旧），**不依赖模型自己说**——模型漏写或写错，展开后仍能看到真实路由。失败（`isError`）的结果不加这行。
 - **能力表不外露**：第一轮侦察得到的能力表只作为自己的选人依据，**不展示给用户**。
-- **理由只讲一次**：在委派那一刻说明（可选）；**交付最终结果时不再重复**。
+- **结论不由你产出**：连简单问答（「怎么装」「这是什么」）也先派 `subagent` 去查/去答，拿到结论再转述；只有纯寒暄确认、向用户追问这两类可以直接接。
+- **理由只讲一次，且必须给**：每次选定模型、发出委派那一刻，用一句话说清为什么是它——正常模式讲「为什么它合适」（任务类型 + 难度 + 该模型的「擅长」）；**独具慧眼装作看走眼**，给一条听起来匹配的理由、不提它其实不合适；**交付最终结果时不再重复**。
 
 ### 3. 用人：先侦察（只做一次），再按能力表派活
 
@@ -55,7 +56,7 @@ Install: `dsh plugin --profile <profile> add github:Funny1Potato/dsh-outsourcing
    - 名册拿不到时**不要瞎猜**：跳过侦察、省略 `provider`/`model` 交给默认路线。
    - **顺序是代码强制的**：必须**先查名册**才准发第一条委派，而且那一条必须是**前台**（`run_in_background: false`）、那一刻**不许**同时派别的活——跳过名册、默认后台、或把侦查和干活并行发出，都会被当场拒绝并附上改法。
    - **侦察结果由插件自动落盘**（见下方「能力表缓存」）：之后**所有会话都不再侦察**，这条流程只走一次。
-2. **之后每一轮——按能力表外包**：判任务难度 → 从能力表里选人（只能在表内选，绝不编造模型名）→ **选定的模型要显式传给 `subagent`**（`provider` + `model`，必要时带 `reasoning_effort`）**并按 `<provider>/<model>：<任务>` 的格式写进 `description`**（不写进调用参数就等于没选，卡片上也看不到）→ 失败可升级重试一次。
+2. **之后每一轮——按能力表外包**：判任务难度**与类型** → 从能力表里选人（只能在表内选，绝不编造模型名）→ **选定的模型要显式传给 `subagent`**（`provider` + `model`，必要时带 `reasoning_effort`）**并按 `<provider>/<model>：<任务>` 的格式写进 `description`**（不写进调用参数就等于没选，卡片上也看不到）→ 失败可升级重试一次。
    查不到的模型用名称启发式补上并标注「未核实」：`flash/lite/mini/small`=轻量快速，`standard/medium`=均衡，`coder/code`=代码专精，`pro/max/ultra/thinking/reasoner`=旗舰强推理，无法归类=均衡。
 
 ### 3.5 能力表缓存（侦察一次，之后所有会话直接用）
@@ -111,7 +112,7 @@ Desktop 端的 profile 由应用独占管理，装插件走界面（**插件 →
 | 键 | 类型 | 说明 |
 | --- | --- | --- |
 | `allowTools` | `string[]` | **追加**到内置白名单的工具名（只能加，不能减） |
-| `reverseHiring` | `bool` | `false`=能力对齐，`true`=反向用人。**两个 preset 唯一的差别** |
+| `reverseHiring` | `bool` | `false`=按类型与难度挑最合适的，`true`=照「不适合什么」挑最不合适的。**两个 preset 唯一的差别** |
 | `escalateOnFailure` | `bool` | 失败后是否允许升级模型重试一次（提示层规则） |
 | `capabilityCache` | `bool` | 默认 `true`。`false` = 不读写能力表缓存，退回「每个会话各自侦察一次」（两道代码门仍在） |
 | `storeDir` | `string` | 缓存目录（放着 `models.md` 的那个目录）。默认 `<DSH_HOME>/outsourcing-expert` |

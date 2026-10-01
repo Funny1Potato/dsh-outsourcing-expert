@@ -7,8 +7,8 @@
 # 的会话完全看不到它们。
 #
 # 两个 preset 的差别只有一个字段：
-#   1. 「外包高手」            → config.reverseHiring: false，按能力对齐选人（正常）
-#   2. 「外包高手（独具慧眼）」 → config.reverseHiring: true，故意反着选（越难越用弱模型）
+#   1. 「外包高手」            → config.reverseHiring: false，按任务类型 + 难度挑最合适的（正常）
+#   2. 「外包高手（独具慧眼）」 → config.reverseHiring: true，故意反着选（挑最不适合这个任务的）
 #
 # ⚠ preset 的 `config.id` **一旦发布就不要再改**：id 会被**会话头、界面设置、客户端缓存**
 #   长期引用，改它会让已有会话与已保存的选择全部指向一个不存在的 preset（报
@@ -32,7 +32,7 @@
       config:
         id: outsourcing-expert
         name: 外包高手
-        description: 活都外包出去：自己不亲自动手，按任务难度挑合适的模型交给子智能体。
+        description: 活都外包出去：自己不亲自动手，按任务的难度与类型挑合适的模型交给子智能体。
         order: 5
         plugins:
           - id: persona
@@ -187,7 +187,7 @@
               # 名单里——要用 ptc preset 就把它加上。本 preset 是 native 工具模式，
               # 不涉及这条。
               allowTools: []
-              # 正常选人：按任务难度做能力对齐。
+              # 正常选人：按任务类型 + 难度做能力对齐。
               reverseHiring: false
               # 子任务失败后是否允许升级模型重试一次。
               escalateOnFailure: true
@@ -196,7 +196,7 @@
               # 关掉它就退回「每个会话各自侦察一次」的老行为。
               capabilityCache: true
     # ====================================================================
-    # preset 2：「外包高手（独具慧眼）」（越难越用弱模型）
+    # preset 2：「外包高手（独具慧眼）」（专挑干不了这个任务的）
     # 花名册与 preset 1 逐行相同，只有最后那行插件的 reverseHiring 不同。
     # ====================================================================
     - id: preset-outsourcing-expert-reverse
@@ -204,7 +204,7 @@
       config:
         id: outsourcing-expert-reverse
         name: 外包高手（独具慧眼）
-        description: 同上，但故意反着挑人：任务越难越用弱模型，越简单越用强模型。
+        description: 同上，但故意反着挑人：照能力表「不适合什么」挑，专挑干不了这个任务的模型。
         order: 6
         plugins:
           - id: persona
@@ -350,7 +350,7 @@
             name: dsh-outsourcing-expert
             config:
               allowTools: []
-              # 反向用人：越难的任务故意用越弱的模型，越简单故意用越强的模型。
+              # 反向用人：照能力表「不适合什么」那栏反着挑，专挑干不了这个任务的模型。
               reverseHiring: true
               escalateOnFailure: true
               # 与 preset 1 共用同一份能力表缓存（缓存是机器级的，与工作区、用人规则无关）。

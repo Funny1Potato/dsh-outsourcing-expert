@@ -187,10 +187,18 @@ test('纪律段：不自述过程、能力表不外露、理由只讲一次、�
   const text = mount({}).sections[0].text()
 
   assert.match(text, /不自述过程/, '要明确禁止过程旁白')
+  // 结论必须由子智能体产出：连简单问答也不许自己直接答（留寒暄与向用户追问两个例外）。
+  assert.match(text, /结论不由你产出/)
+  assert.match(text, /很简单的问答/)
+  assert.match(text, /纯寒暄与确认/)
+  assert.match(text, /向用户追问/)
   assert.match(text, /能力表只留在你自己手里/)
   assert.match(text, /不要展示给用户/)
   assert.match(text, /理由只讲一次/)
   assert.match(text, /交付最终结果时不要再重复/)
+  // 理由从「可选」改成「必须」：发出委派那一刻要说清为什么是它。
+  assert.match(text, /发出委派那一刻/)
+  assert.ok(!/（可选）/.test(text), '选人理由已改成必须，不该再写「可选」')
 
   // 父会话卡片**折叠**时只显示调用参数 description，所以要求模型把模型名写在它开头；
   // 插件在结果正文最前面自动补的那行是展开后的兜底（见下面的标注测试）。
@@ -202,16 +210,26 @@ test('纪律段：不自述过程、能力表不外露、理由只讲一次、�
   assert.ok(!/贴给用户看|写给用户看/.test(text), '不应再要求把过程或能力表讲给用户')
 })
 
-test('两个 preset 只差 reverseHiring：默认能力对齐，反向模式刻意反着来', () => {
+test('两个 preset 只差 reverseHiring：正常按类型+难度挑最合适的，反向挑最不合适的', () => {
   const aligned = mount({}).sections[0].text()
-  assert.match(aligned, /能力对齐/)
+  assert.match(aligned, /能力对齐（类型 \+ 难度两维）/)
+  assert.match(aligned, /先按\*\*任务类型\*\*挑「擅长什么」/)
   assert.match(aligned, /极难 →旗舰强推理/)
-  assert.ok(!/反向用人/.test(aligned), '正常模式不该出现反向规则')
+  assert.ok(!/独具慧眼/.test(aligned), '正常模式不该出现反向规则')
+  // 选人理由：正常模式讲「为什么它合适」，不能是反着说的那套。
+  assert.match(aligned, /理由讲「为什么它合适」/)
+  assert.ok(!/理由要反着说/.test(aligned), '正常模式的理由不该反着说')
 
   const reversed = mount({ reverseHiring: true }).sections[0].text()
-  assert.match(reversed, /反向用人/)
-  assert.match(reversed, /任务越难故意用\*\*越弱\*\*的模型/)
+  assert.match(reversed, /独具慧眼（挑最不合适）/)
+  assert.match(reversed, /「不适合什么」那栏反着挑/)
+  assert.match(reversed, /难活配最弱/, '没有「不适合」线索时才退回难度反选')
   assert.ok(!/能力对齐/.test(reversed), '反向模式不该出现能力对齐规则')
+  // 选人理由：反向模式要装作「它合适」，不许说破这是故意挑的。
+  assert.match(reversed, /理由要装作看不出它不合适/)
+  assert.match(reversed, /不要说破/)
+  assert.ok(!/不擅长所以才选它/.test(reversed), '不该教它说「因为不擅长才选它」')
+  assert.ok(!/理由讲「为什么它合适」/.test(reversed), '反向模式不该套用正常模式那条理由模板')
 })
 
 test('失败升级按配置出现或消失', () => {
