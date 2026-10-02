@@ -363,6 +363,111 @@ function parseCapabilityTable(text) {
   return rows
 }
 
+/**
+ * 解析名册（`list_subagent_models` 的返回正文）：客户端里**实际配置**的供应商与路线。
+ *
+ * 为什么需要它：侦察兵是联网查来的，很容易按模型名把 provider 写成真实厂商/发布者
+ * （`deepseek` / `anthropic` / `openai`），而客户端里配置的供应商名往往完全另一个样
+ * （`deepseek-account`）。写歪的表一旦落盘就会长期误导后续委派（拿着不存在的 provider
+ * 去调，直接被策略拒），所以落盘前要拿名册把 provider 校准回去。
+ *
+ * 名册两种行都认：`providerId — 供应商名`（不传参数时列 provider）与
+ * `providerId/modelId — 模型名: 说明`（传 provider 时列模型）。
+ * @param {string} text - 名册工具返回的正文
+ * @returns {{
+ *   providers: Set<string>,
+ *   aliases: Map<string, string>,
+ *   routes: Map<string, { provider: string, model: string }>,
+ * }}
+ */
+function parseRoster(text) {
+  const providers = new Set()
+  /** 小写别名（provider id / 显示名）→ 名册原文的 provider id。 */
+  const aliases = new Map()
+  /** 小写 model id → 名册原文的 `{ provider, model }`。 */
+  const routes = new Map()
+  const addAlias = (key, provider) => {
+    if (key.length > 0 && !aliases.has(key.toLowerCase())) aliases.set(key.toLowerCase(), provider)
+  }
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim()
+    if (line === '') continue
+    // 名册每行的形状是「标识 — 人话」；分隔符取 harness 用的 em dash（也容忍 ` - `）。
+    const cut = line.search(/\s[—–-]\s/)
+    const head = (cut === -1 ? line : line.slice(0, cut)).trim()
+    if (head === '') continue
+    const slash = head.indexOf('/')
+    if (slash > 0 && slash < head.length - 1) {
+      // 按**第一个** `/` 切：model id 本身可能带 `/`（例如 openrouter 上的厂商前缀）。
+      const provider = head.slice(0, slash).trim()
+      const model = head.slice(slash + 1).trim()
+      if (provider === '' || model === '') continue
+      providers.add(provider)
+      addAlias(provider, provider)
+      const key = model.toLowerCase()
+      if (!routes.has(key)) routes.set(key, { provider, model })
+      continue
+    }
+    // 没有 `/` 的行是 provider 列表：`providerId — 供应商名`。
+    if (!/^[\w.-]+$/.test(head)) continue
+    providers.add(head)
+    addAlias(head, head)
+    const tail = cut === -1 ? '' : line.slice(cut).replace(/^\s+[—–-]\s+/, '')
+    const display = tail.split(':')[0].trim()
+    if (display.length >= 3) addAlias(display, head)
+  }
+  return { providers, aliases, routes }
+}
+
+/** 供应商名的宽松匹配：`deepseek` ↔ 名册里的 `deepseek-account`（唯一命中才算）。 */
+function looseProvider(provider, roster) {
+  const token = provider.toLowerCase()
+  if (token === '') return undefined
+  const matches = [...roster.providers].filter((candidate) => {
+    const id = candidate.toLowerCase()
+    return id.startsWith(`${token}-`) || id.startsWith(`${token}_`)
+      || token.startsWith(`${id}-`) || token.startsWith(`${id}_`)
+  })
+  return matches.length === 1 ? matches[0] : undefined
+}
+
+/**
+ * 把表里的一格 `provider/model` 校准成名册原文；对不上名册就返回 undefined（这行不可信）。
+ * 先按 model 对（模型 id 是侦察兵从清单里抄的，最可靠），对上了整条换成名册原文；model 对
+ * 不上再按 provider 对（大小写差异，或 `deepseek` ↔ `deepseek-account` 这类加后缀写法）。
+ * @param {string} route - 表里的 `provider/model` 单元格（也可能只有 model）
+ * @param {ReturnType<typeof parseRoster>} roster
+ * @returns {string | undefined}
+ */
+function alignRouteToRoster(route, roster) {
+  const slash = route.indexOf('/')
+  const provider = (slash === -1 ? '' : route.slice(0, slash)).trim()
+  const model = (slash === -1 ? route : route.slice(slash + 1)).trim()
+  if (model === '') return undefined
+  const pair = roster.routes.get(model.toLowerCase())
+  if (pair !== undefined) return `${pair.provider}/${pair.model}`
+  const canonical = roster.aliases.get(provider.toLowerCase()) ?? looseProvider(provider, roster)
+  return canonical === undefined ? undefined : `${canonical}/${model}`
+}
+
+/**
+ * 用名册校准整张表。**拿不到名册就不动**（没有权威来源，宁可不校准也不乱改）；有名册时
+ * 对不上名册的行直接丢掉——留着只会让后续委派拿着一个不存在的 provider 去调，当场被拒。
+ * @param {{ model?: unknown }[]} rows - 解析出的结构化能力表
+ * @param {ReturnType<typeof parseRoster> | undefined} roster
+ * @returns {{ model?: unknown }[]}
+ */
+function alignRowsToRoster(rows, roster) {
+  if (roster === undefined || roster.providers.size === 0) return rows
+  const aligned = []
+  for (const row of rows) {
+    const route = alignRouteToRoster(String(row?.model ?? ''), roster)
+    if (route === undefined) continue
+    aligned.push({ ...row, model: route })
+  }
+  return aligned
+}
+
 /** 把结构化能力表渲染回 markdown 表——提示段与命令显示共用同一份渲染，避免两处不一致。 */
 function renderCapabilityRows(models) {
   const cell = (value) => String(value).replace(/\|/g, '\\|')
@@ -458,17 +563,26 @@ function createStore(dir) {
     /**
      * 写入缓存（JSON；先写 `.tmp` 再改名，避免半截文件被读到）。
      * 能按表头解析出结构就存 `models` 数组，否则存 `raw` 原文——**两种都是 JSON**，
-     * 绝不因为解析失败丢掉整张表。写成功后顺手删掉老 markdown，免得两份互相打架。
+     * 绝不因为解析失败丢掉整张表。
+     *
+     * 例外：拿到了名册（`list_subagent_models` 的结果）时，表先按名册校准 provider、
+     * 对不上的行丢掉；校准不出两张表就**整份不写、返回 undefined**——这时候退回 `raw`
+     * 等于把那个派不动的 provider 原样存进去，只会继续误导后续委派。
+     * 写成功后顺手删掉老 markdown，免得两份互相打架。
      * @param {string} text - 侦察返回的正文
      * @param {string} [source] - 供人看的来源说明
+     * @param {ReturnType<typeof parseRoster>} [roster] - 名册（权威的供应商与路线）
+     * @returns {object | undefined} 写进去的内容；整份没写时为 undefined
      */
-    write(text, source) {
+    write(text, source, roster) {
       const body = clampChars(text.trim(), MAX_TABLE_CHARS)
-      const models = parseCapabilityTable(body)
+      const models = alignRowsToRoster(parseCapabilityTable(body), roster)
+      const structured = models.length >= 2
+      if (!structured && roster !== undefined && roster.providers.size > 0) return undefined
       const payload = {
         updatedAt: new Date().toISOString(),
         ...source === undefined ? {} : { source },
-        ...(models.length >= 2 ? { models } : { raw: body }),
+        ...(structured ? { models } : { raw: body }),
       }
       mkdirSync(dir, { recursive: true })
       const temp = `${file}.tmp`
@@ -495,9 +609,11 @@ function formatCacheDate(cache) {
 
 /** 每次委派都要遵守的 description 格式（两个分支共用）。 */
 const DELEGATION_FORMAT = '**每次委派的 `description` 都要以模型开头**：'
-  + '`<provider>/<model>：<任务>`，例如 `deepseek-account/deepseek-v4-pro：读 README 并总结`；'
-  + '没指定模型、交给默认路线时就写 `默认路线：<任务>`。父会话里那张卡片折叠时只显示这一行'
-  + '——用户扫一眼就知道活派给了谁。'
+  + '`<provider>/<model>：<任务>`，例如 `deepseek-account/deepseek-v4-pro：读 README 并总结`。'
+  + '这里 `provider` 是**客户端里配置的供应商名**（照名册/能力表原文抄，可能带 `-account` 这类'
+  + '后缀）——**不是模型的真实厂商/发布者**，把它写成 `deepseek` / `anthropic` / `openai` '
+  + '这种就对不上名册、委派会被拒。没指定模型、交给默认路线时就写 `默认路线：<任务>`；'
+  + '父会话里那张卡片折叠时只显示这一行——用户扫一眼就知道活派给了谁。'
 
 /**
  * 「按能力表派活」那几条纪律，两个分支共用。
@@ -542,10 +658,11 @@ function reconPlan(reverse, escalateOnFailure, naming) {
     ? '1. **先查名册**：还没调过 \`list_subagent_models\` 就发第一条委派，会被拒绝——名册是侦察\n   的前提，也是你之后贴给侦察兵的清单。'
     : '1. **本 preset 没有 \`list_subagent_models\`**：跳过查名册，直接用你已知的模型名当清单。'
   const stepRoster = naming.roster
-    ? '1. **取名册**：调 \`list_subagent_models\`（无参数 → 已授权的 provider 列表；再按 provider\n'
-      + '   逐个查它公布的模型）。把返回的**完整模型清单**抄下来。该工具不可用、或没列出任何模型时：\n'
-      + '   **不要瞎猜**——跳过侦察，把 \`provider\` / \`model\` / \`reasoning_effort\` 全部省略交给\n'
-      + '   默认路线。'
+    ? '1. **取名册**：调 \`list_subagent_models\`（**参数整个省略**——写成空字符串会被拒；\n'
+      + '   无参数 → 已授权的 provider 列表，再按 provider 逐个查它公布的模型）。把返回的\n'
+      + '   **完整模型清单**抄下来（provider 名照抄，别换成模型的真实厂商）。该工具不可用、\n'
+      + '   或没列出任何模型时：**不要瞎猜**——跳过侦察，把 \`provider\` / \`model\` /\n'
+      + '   \`reasoning_effort\` 全部省略交给默认路线。'
     : '1. **清单从哪来**：本 preset 没有 \`list_subagent_models\`，就用你已知的模型名当清单；'
       + '实在\n   列不出来，就把 \`provider\` / \`model\` / \`reasoning_effort\` 全省略、交给默认路线。'
   return `## 用人两步走：先摸清人选，再决定派谁
@@ -575,6 +692,9 @@ ${stepRoster}
      并**附上来源链接**；
    - 要求它按固定格式返回一张**能力表**：每个模型一行，写清 provider/model、能力档位
      （轻量快速 / 均衡 / 代码专精 / 旗舰强推理 / 多模态…）、擅长什么、不适合什么、来源；
+   - **provider 一栏必须照抄你贴给它的清单原文**：那是客户端里配置的供应商名（可能带
+     \`-account\` 这类后缀），**不是模型的真实厂商/发布者**——不要写成 \`deepseek\` /
+     \`anthropic\` / \`openai\` 这种，写错就对不上名册、这张表会被丢掉重来；
    - **这份结果会被自动缓存到本机**（之后所有会话直接复用、不再侦察），所以格式要守住：
      **至少两行、每行含 provider/model，并且出现能力档位词**——达不到就不会被缓存，
      下个会话还得重来。
@@ -703,6 +823,12 @@ export function apply(ctx, config = {}) {
   const foregroundInFlight = new Set()
   /** 已经调过名册工具的发起方（缓存为空时的那道门）。 */
   const rosterRead = new Set()
+  /**
+   * 发起方 → 名册解析结果。侦察表落盘前照它把 provider 校准回配置里的名字
+   * （侦察兵联网查来的表容易写成模型的真实厂商名）。合并多次调用：先列 provider、
+   * 再逐个 provider 列模型。
+   */
+  const rosters = new Map()
   /** 待缓存的侦察：发起方 → 那条委派的模型路线（跑完就写进缓存）。 */
   const reconPending = new Map()
   /** 发起方 → 已经试过几次「结果不像能力表」（配合 MAX_RECON_TRIES 用）。 */
@@ -763,20 +889,40 @@ export function apply(ctx, config = {}) {
     }
   }
 
+  /** 把一次名册结果并进这个发起方的名册（同一会话可能要查好几次：先 list provider 再逐个列模型）。 */
+  const rememberRoster = (agentId, text) => {
+    const parsed = parseRoster(text)
+    if (parsed.providers.size === 0) return
+    const merged = rosters.get(agentId)
+      ?? { providers: new Set(), aliases: new Map(), routes: new Map() }
+    for (const provider of parsed.providers) merged.providers.add(provider)
+    for (const [key, value] of parsed.aliases) if (!merged.aliases.has(key)) merged.aliases.set(key, value)
+    for (const [key, value] of parsed.routes) if (!merged.routes.has(key)) merged.routes.set(key, value)
+    // 重新 set 一次把这条挪到末尾，超出容量先丢最旧的——长跑进程里不会无限涨。
+    rosters.delete(agentId)
+    rosters.set(agentId, merged)
+    while (rosters.size > 32) rosters.delete(rosters.keys().next().value)
+  }
+
   /**
    * 把这次侦察结果写进缓存。
+   * @param {string} agentId - 发起侦察的会话（据它取名册，校准表里的 provider）
    * @param {string} route - 侦察那条委派的模型路线
    * @param {unknown} result - 委派结果
    * @returns {boolean} 真的写进去了才为 true——调用方据此决定要不要把「待缓存」标记消费掉
    */
-  const persistRecon = (route, result) => {
+  const persistRecon = (agentId, route, result) => {
     const text = resultText(result)
     if (text === '' || !looksLikeCapabilityTable(text)) {
       ctx.logger?.debug?.('outsourcing-expert: 侦察结果不像能力表，未写入缓存')
       return false
     }
     try {
-      store.write(text, `子智能体侦察（${route}）`)
+      const written = store.write(text, `子智能体侦察（${route}）`, rosters.get(agentId))
+      if (written === undefined) {
+        ctx.logger?.debug?.('outsourcing-expert: 侦察表对不上名册，整份未写入缓存')
+        return false
+      }
       ctx.logger?.debug?.(`outsourcing-expert: 能力表已缓存到 ${store.file}`)
       return true
     } catch (error) {
@@ -889,6 +1035,13 @@ export function apply(ctx, config = {}) {
     const delegation = DELEGATION_TOOLS.has(exec?.name)
     if (agent !== undefined && delegation) foregroundInFlight.delete(agent.id)
 
+    // 名册结果是「客户端里实际配置的供应商与路线」的权威来源：先记住，侦察表落盘前照它
+    // 校准 provider（侦察兵联网查来的表容易把 provider 写成模型的真实厂商名，照抄那个
+    // 后续委派会被策略拒）。合并多次调用：先 list provider、再逐个 provider 列模型。
+    if (agent !== undefined && exec?.name === ROSTER_TOOL && result?.isError !== true) {
+      rememberRoster(agent.id, resultText(result))
+    }
+
     // 侦察结果缓存：只有「空表时那条被标成侦察的委派」才会命中，而且要求它成功。
     // 关键：**只有真的写进缓存才丢标记**——第一条结果不像能力表（侦察兵翻车、被深度上限
     // 拒了…）时留着它，后面那次合格的能力表才不会被漏掉。实测踩过：16:13 清空后第一条
@@ -899,14 +1052,16 @@ export function apply(ctx, config = {}) {
     if (agent !== undefined && delegation && !isSubagent(agent) && reconPending.has(agent.id)) {
       if (result?.isError !== true) {
         const route = reconPending.get(agent.id)
-        if (persistRecon(route, result)) {
+        if (persistRecon(agent.id, route, result)) {
           reconPending.delete(agent.id)
           reconAttempts.delete(agent.id)
+          rosters.delete(agent.id)
         } else {
           const tries = (reconAttempts.get(agent.id) ?? 0) + 1
           if (tries >= MAX_RECON_TRIES) {
             reconPending.delete(agent.id)
             reconAttempts.delete(agent.id)
+            rosters.delete(agent.id)
             ctx.logger?.debug?.(`outsourcing-expert: 侦察连续 ${tries} 次不像能力表，本会话放弃缓存`)
           } else {
             reconAttempts.set(agent.id, tries)

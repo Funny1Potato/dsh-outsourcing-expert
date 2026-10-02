@@ -147,6 +147,25 @@ const nextPost = () => Promise.resolve({ kind: 'accept' })
 /** 模拟「先查名册」：缓存为空时，这是发第一条委派的前提（同一批次里 pre-execute 按顺序跑）。 */
 const readRoster = (preExecute) => preExecute(exec('list_subagent_models'), next)
 
+/**
+ * 名册正文（`list_subagent_models` 的返回）：provider 是**客户端里配置的供应商名**，
+ * 常带 `-account` 这类后缀——它才是校准侦察表 provider 的权威来源。
+ */
+const ROSTER_PROVIDERS = [
+  'deepseek-account — DeepSeek 账号',
+  'xiaomi-tp — 小米 Token Plan',
+].join('\n')
+
+/** 名册里逐个 provider 列出的模型（`provider/modelId — 模型名: 说明`）。 */
+const ROSTER_ROUTES = [
+  'deepseek-account/deepseek-v4-pro — DeepSeek V4 Pro: 旗舰强推理',
+  'xiaomi-tp/mimo-v2.6-flash — MiMo v2.6 Flash: 轻量快速',
+].join('\n')
+
+/** 把一条名册结果喂给 post-execute：插件据此记住权威的 provider/model。 */
+const feedRoster = (postExecute, text = `${ROSTER_PROVIDERS}\n${ROSTER_ROUTES}`) =>
+  postExecute(exec('list_subagent_models'), { isError: false, content: [{ type: 'text', text }] }, nextPost)
+
 test('模块导出符合 Cordis 插件契约', () => {
   assert.equal(name, 'outsourcing-expert')
   assert.deepEqual(inject, ['tools', 'systemPrompt'])
@@ -671,6 +690,92 @@ test('侦察结果不像能力表就不写缓存（宁缺勿脏）', async () =>
     nextPost,
   )
   assert.ok(!existsSync(cacheFile(second.storeDir)), '失败的结果不该写进缓存')
+})
+
+test('能力表里的 provider 一律校准成客户端配置的供应商名（不接受模型的真实厂商名）', async () => {
+  const mounted = mount({})
+  const preExecute = mounted.listener('tools/pre-execute')
+  const postExecute = mounted.listener('tools/post-execute')
+  // 侦察兵联网查来的表：provider 一栏写成了模型的真实厂商（还带大小写差异）
+  const scoutTable = [
+    '| 模型 | 档位 | 擅长 | 不适合 | 来源 |',
+    '| --- | --- | --- | --- | --- |',
+    '| DeepSeek/deepseek-v4-pro | 旗舰强推理 | 复杂重构 | 闲聊 | https://example.com/a |',
+    '| Xiaomi/mimo-v2.6-flash | 轻量快速 | 单文件改动 | 长链路推理 | https://example.com/b |',
+  ].join('\n')
+
+  await readRoster(preExecute)
+  await feedRoster(postExecute)
+  await preExecute(exec('subagent', 0, { run_in_background: false }), next)
+  await postExecute(
+    exec('subagent', 0, { run_in_background: false }),
+    { isError: false, content: [{ type: 'text', text: scoutTable }] },
+    nextPost,
+  )
+
+  const written = JSON.parse(readFileSync(cacheFile(mounted.storeDir), 'utf8'))
+  assert.equal(written.models[0].model, 'deepseek-account/deepseek-v4-pro', '厂商名要换回配置里的 provider')
+  assert.equal(written.models[1].model, 'xiaomi-tp/mimo-v2.6-flash', 'model 对上名册就得认出配置名')
+})
+
+test('名册只列了 provider 时，也能把厂商名认回带后缀的配置名', async () => {
+  const mounted = mount({})
+  const preExecute = mounted.listener('tools/pre-execute')
+  const postExecute = mounted.listener('tools/post-execute')
+  const scoutTable = [
+    '| 模型 | 档位 | 擅长 | 不适合 | 来源 |',
+    '| --- | --- | --- | --- | --- |',
+    '| deepseek/deepseek-v4-pro | 旗舰强推理 | 复杂重构 | 闲聊 | https://example.com/a |',
+    '| xiaomi/mimo-v2.6-flash | 轻量快速 | 单文件改动 | 长链路推理 | https://example.com/b |',
+  ].join('\n')
+
+  await readRoster(preExecute)
+  await feedRoster(postExecute, ROSTER_PROVIDERS)
+  await preExecute(exec('subagent', 0, { run_in_background: false }), next)
+  await postExecute(
+    exec('subagent', 0, { run_in_background: false }),
+    { isError: false, content: [{ type: 'text', text: scoutTable }] },
+    nextPost,
+  )
+
+  const written = JSON.parse(readFileSync(cacheFile(mounted.storeDir), 'utf8'))
+  assert.deepEqual(
+    written.models.map(row => row.model),
+    ['deepseek-account/deepseek-v4-pro', 'xiaomi-tp/mimo-v2.6-flash'],
+  )
+})
+
+test('对不上名册的行会被丢掉；凑不够两行就整份不写（宁可没表，也不留派不动的 provider）', async () => {
+  const mounted = mount({})
+  const preExecute = mounted.listener('tools/pre-execute')
+  const postExecute = mounted.listener('tools/post-execute')
+  const scoutTable = [
+    '| 模型 | 档位 | 擅长 | 不适合 | 来源 |',
+    '| --- | --- | --- | --- | --- |',
+    '| openai/gpt-5 | 旗舰强推理 | 复杂重构 | 闲聊 | https://example.com/a |',
+    '| deepseek-account/deepseek-v4-pro | 旗舰强推理 | 复杂重构 | 闲聊 | https://example.com/b |',
+  ].join('\n')
+
+  await readRoster(preExecute)
+  await feedRoster(postExecute, 'deepseek-account — DeepSeek 账号')
+  await preExecute(exec('subagent', 0, { run_in_background: false }), next)
+  await postExecute(
+    exec('subagent', 0, { run_in_background: false }),
+    { isError: false, content: [{ type: 'text', text: scoutTable }] },
+    nextPost,
+  )
+
+  // 只剩一行可用 → 不能退回原文（原文里正写着派不动的 provider），整份不写等重试
+  assert.ok(!existsSync(cacheFile(mounted.storeDir)), '名册对不上的表绝不能落盘')
+})
+
+test('提示层明说 provider 是客户端配置的供应商名，不是模型的真实厂商', () => {
+  const text = mount({}).sections[0].text()
+  assert.match(text, /客户端里配置的供应商名/)
+  assert.match(text, /不是模型的真实厂商/)
+  assert.match(text, /provider 一栏必须照抄/)
+  // 空字符串会被名册工具拒（实测：模型传 {"provider":""} 直接报错），参数要整个省略
+  assert.match(text, /参数整个省略/)
 })
 
 test('第一条侦察结果不像能力表时不消费标记，第二条合格的仍能落盘', async () => {
