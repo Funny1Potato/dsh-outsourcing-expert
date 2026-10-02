@@ -29,7 +29,9 @@ on:
     types: [published]
 
 permissions:
-  contents: read
+  # write, for attaching the release tarball below; id-token, for the OIDC
+  # exchange trusted publishing performs.
+  contents: write
   id-token: write
 
 jobs:
@@ -69,6 +71,28 @@ jobs:
 
       - name: Contract tests
         run: node --test
+
+      # The tarball the release serves and the tarball npm publishes come from
+      # this same checkout and this same npm, so they are byte-identical. That
+      # is the point: building the asset by hand on someone's machine once
+      # produced a README with CRLF while npm had LF, and the two artifacts
+      # drifted apart.
+      #
+      # The asset name carries no version on purpose — releases/latest/download/
+      # takes the filename literally, so a versioned name would 404 the moment
+      # the next release exists.
+      #
+      # Attached before publishing, so a release still carries its installable
+      # artifact even if the registry publish fails.
+      - name: Attach the release tarball
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          name="$(node -p 'require("./package.json").name')"
+          file="$(npm pack --silent)"
+          mv "${file}" "${name}.tgz"
+          gh release upload "${GITHUB_REF_NAME}" "${name}.tgz" --clobber
 
       # A plain release passes no --tag, so it needs only the trusted
       # publisher's publish permission: setting `latest` is part of publishing.
