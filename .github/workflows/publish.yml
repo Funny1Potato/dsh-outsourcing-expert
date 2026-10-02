@@ -4,23 +4,25 @@ name: Publish to npm
 # is spent for good, so publishing belongs to the deliberate release step
 # rather than to a push onto main.
 #
-# One-time setup, either route:
+# Set up once, in this order — the workflow below is the last step:
 #
-#   A. Token — what runs as written.
-#      Create a granular npm access token limited to this package with
-#      read-and-write permission, and add it to this repository as the secret
-#      NPM_TOKEN. Never a classic account-wide automation token: this secret
-#      publishes as you.
+#   1. Bootstrap the package. A trusted publisher is configured on an existing
+#      package's settings page, so the package has to exist first: publish it
+#      once by hand (`npm login && npm publish`) and never again. A granular
+#      token can do that first publish too, but npm is retiring direct
+#      publishing with granular tokens in January 2027, so the manual route is
+#      the one with no expiry.
+#   2. Configure the trusted publisher: npmjs.com → Packages →
+#      dsh-outsourcing-expert → Settings → Trusted publishing → GitHub Actions,
+#      with repository Funny1Potato/dsh-outsourcing-expert and workflow
+#      publish.yml — the file name only, extension included, and it has to be
+#      this file inside .github/workflows/.
+#   3. Nothing else. A published Release then publishes to npm through OIDC
+#      with no secret stored anywhere, and npm attaches provenance itself.
 #
-#   B. Trusted publishing — no secret stored anywhere.
-#      Configure this repository and this workflow file as a trusted publisher
-#      for the package on npmjs.com, then delete the `env:` block on the publish
-#      step below and remove the NPM_TOKEN secret. npm exchanges the workflow's
-#      OIDC token for a short-lived credential instead, which is why
-#      id-token: write is already granted here.
-#
-# --provenance needs that id-token grant and a public repository; it attaches an
-# attestation tying the published tarball to this commit.
+# npm does not check the trusted-publisher configuration when it is saved: a
+# wrong repository or file name surfaces as an authentication failure at the
+# first publish, never at setup time.
 
 on:
   release:
@@ -38,13 +40,18 @@ jobs:
         with:
           ref: ${{ github.event.release.tag_name }}
 
-      # Node 24 carries npm 11, whose publish supports provenance and trusted
-      # publishing; the tarball is source-only, so this choice does not change
-      # what ships.
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
           registry-url: https://registry.npmjs.org
+
+      # Trusted publishing needs npm CLI 11.21.0 or later, and the npm bundled
+      # with Node 24 still reports 11.9.x. Whatever ships after this step is
+      # source-only, so the CLI version changes nothing about the tarball.
+      - name: Ensure an npm that supports trusted publishing
+        run: |
+          npm install -g npm@latest
+          npm --version
 
       # The release tag is the only claim about which version this commit is. A
       # mismatch means the release and the manifest disagree, and publishing
@@ -65,7 +72,11 @@ jobs:
 
       # A prerelease release goes to the `next` dist-tag, so it can never take
       # over `latest` for everyone installing by name.
+      #
+      # No NODE_AUTH_TOKEN here on purpose: the npm CLI exchanges the workflow's
+      # OIDC token for a short-lived publish credential. To publish with a
+      # granular token instead, add a repository secret NPM_TOKEN and add:
+      #   env:
+      #     NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Publish
         run: npm publish --provenance --access public --tag "${{ github.event.release.prerelease && 'next' || 'latest' }}"
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
