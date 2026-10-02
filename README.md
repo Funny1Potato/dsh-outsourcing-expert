@@ -1,5 +1,7 @@
 # 外包高手（dsh-outsourcing-expert）
 
+[![CI](https://github.com/Funny1Potato/dsh-outsourcing-expert/actions/workflows/ci.yml/badge.svg)](https://github.com/Funny1Potato/dsh-outsourcing-expert/actions/workflows/ci.yml)
+
 一个 DSH 插件包：声明两个 agent preset，把「领导」变成**不亲自干活、把活全外包出去**的角色——先摸清可选模型各自擅长什么，再按任务的难度与类型决定每一件活交给谁。
 
 | preset | id | 选人规则 |
@@ -95,7 +97,7 @@ dsh plugin --profile <profile> add github:Funny1Potato/dsh-outsourcing-expert
 dsh plugin --profile <profile> add link:<本目录绝对路径>
 ```
 
-Desktop 端的 profile 由应用独占管理，装插件走界面（**插件 → 添加插件**，填 `github:Funny1Potato/dsh-outsourcing-expert`、本地目录绝对路径或 `link:<路径>`）。装完后**新建会话**，在 preset 选择里选「外包高手」或「外包高手（独具慧眼）」。
+Desktop 端走界面最省事（**插件 → 添加插件**，填 `github:Funny1Potato/dsh-outsourcing-expert`、本地目录绝对路径或 `link:<路径>`）；要用命令行管 `desktop` profile，得用桌面端**自带的那份** `dsh`（`where dsh` 里排第一的那个），别的 dsh 安装会被拒（`profile "desktop" is managed exclusively by the Electron application`）。装完后**新建会话**，在 preset 选择里选「外包高手」或「外包高手（独具慧眼）」。
 
 ## 文件
 
