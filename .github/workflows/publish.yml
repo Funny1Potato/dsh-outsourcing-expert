@@ -70,8 +70,8 @@ jobs:
       - name: Contract tests
         run: node --test
 
-      # A prerelease release goes to the `next` dist-tag, so it can never take
-      # over `latest` for everyone installing by name.
+      # A plain release passes no --tag, so it needs only the trusted
+      # publisher's publish permission: setting `latest` is part of publishing.
       #
       # No NODE_AUTH_TOKEN here on purpose: the npm CLI exchanges the workflow's
       # OIDC token for a short-lived publish credential. To publish with a
@@ -79,4 +79,13 @@ jobs:
       #   env:
       #     NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Publish
-        run: npm publish --provenance --access public --tag "${{ github.event.release.prerelease && 'next' || 'latest' }}"
+        if: ${{ !github.event.release.prerelease }}
+        run: npm publish --provenance --access public
+
+      # A prerelease goes to the `next` dist-tag so it can never take over
+      # `latest` for everyone installing by name. Managing dist-tags is a
+      # separate permission on the trusted publisher — enable it there, or this
+      # step fails with an authentication error.
+      - name: Publish a prerelease to the next dist-tag
+        if: ${{ github.event.release.prerelease }}
+        run: npm publish --provenance --access public --tag next
