@@ -1,0 +1,71 @@
+name: Publish to npm
+
+# Runs when a GitHub Release is published, and only then. An npm version number
+# is spent for good, so publishing belongs to the deliberate release step
+# rather than to a push onto main.
+#
+# One-time setup, either route:
+#
+#   A. Token — what runs as written.
+#      Create a granular npm access token limited to this package with
+#      read-and-write permission, and add it to this repository as the secret
+#      NPM_TOKEN. Never a classic account-wide automation token: this secret
+#      publishes as you.
+#
+#   B. Trusted publishing — no secret stored anywhere.
+#      Configure this repository and this workflow file as a trusted publisher
+#      for the package on npmjs.com, then delete the `env:` block on the publish
+#      step below and remove the NPM_TOKEN secret. npm exchanges the workflow's
+#      OIDC token for a short-lived credential instead, which is why
+#      id-token: write is already granted here.
+#
+# --provenance needs that id-token grant and a public repository; it attaches an
+# attestation tying the published tarball to this commit.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      # Node 24 carries npm 11, whose publish supports provenance and trusted
+      # publishing; the tarball is source-only, so this choice does not change
+      # what ships.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+
+      # The release tag is the only claim about which version this commit is. A
+      # mismatch means the release and the manifest disagree, and publishing
+      # would put that disagreement on npm permanently.
+      - name: Check the release tag matches the package version
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::release tag '${GITHUB_REF_NAME}' does not match package.json version '${version}'"
+            exit 1
+          fi
+          echo "publishing ${version} at ${GITHUB_SHA}"
+
+      - name: Contract tests
+        run: node --test
+
+      # A prerelease release goes to the `next` dist-tag, so it can never take
+      # over `latest` for everyone installing by name.
+      - name: Publish
+        run: npm publish --provenance --access public --tag "${{ github.event.release.prerelease && 'next' || 'latest' }}"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

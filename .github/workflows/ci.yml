@@ -1,0 +1,40 @@
+name: CI
+
+# Contract tests only — packaging and configuration live in cordis.patch.yml,
+# and the plugin's behaviour is pinned by tests/contract.test.mjs, which asserts
+# the registered sections, tools, commands and gates against the source text.
+#
+# Windows is in the matrix on purpose: the plugin owns a real file store
+# (the capability table under $DSH_HOME/outsourcing-expert) and runs on a
+# Windows-first harness, so path and filesystem behaviour belongs under CI.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: node ${{ matrix.node-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        # The harness declares "engines": { "node": "^22.19.0 || >=24.0.0" }.
+        node-version: ['22', '24']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      # The package has no dependencies and no build step, so there is nothing
+      # to install: the source is the artifact.
+      - name: Contract tests
+        run: node --test
