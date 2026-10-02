@@ -10,7 +10,7 @@
  *   - 拒绝必须是 `{ kind: 'deny' }`（旧的 `{ type: 'deny' }` 不是 PreToolDecision）。
  *   - 白名单必须含委派工具本身，否则领导连派活都被自己拦掉。
  *   - 子 Agent 判据看会话头，不是「登记过的 id」。
- *   - 不自述过程、能力表不外露、用人理由只讲一次、模型名写进 `description`（提示层要求，用文案断言钉住）。
+ *   - 选人理由是唯一允许的过程话（其余过程旁白仍禁）、能力表不外露、模型名写进 `description`（提示层要求，用文案断言钉住）。
  *   - 能力表缓存：空表时才拦「没查名册就委派」，侦察结果通过体检才写盘，表存在时不再要求
  *     前台、不再要求名册，提示段换成「直接用表」并把表正文内联进去。
  *   - 提示段必须 `interpolate: false`：宿主对 `{{变量}}` 是严格的，模型写的表里出现
@@ -43,7 +43,7 @@ after(() => {
  * 读写的——不隔离的话测试会去读真机上的 `~/.dsh/outsourcing-expert/models.json`。
  */
 function mount(config, options = {}) {
-  const { exposeBackgroundFlag = true, exposeRosterTool = true } = options
+  const { exposeBackgroundFlag = true, exposeRosterTool = true, toolNames } = options
   const listeners = []
   const sections = []
   const tools = []
@@ -64,11 +64,13 @@ function mount(config, options = {}) {
       register: (definition) => tools.push(definition),
       schemas: (agent) => (agent === undefined
         ? []
-        : [
-          delegationSchema('subagent'),
-          delegationSchema('subagent_fork'),
-          ...exposeRosterTool ? [{ name: 'list_subagent_models', parameters: { properties: {} } }] : [],
-        ]),
+        : toolNames !== undefined
+          ? toolNames.map(delegationSchema)
+          : [
+            delegationSchema('subagent'),
+            delegationSchema('subagent_fork'),
+            ...exposeRosterTool ? [{ name: 'list_subagent_models', parameters: { properties: {} } }] : [],
+          ]),
     },
     get: (key) => {
       // 命令系统是可选的：插件挂得上就该注册 `/outsourcing-models`，取不到也不该崩。
@@ -212,10 +214,13 @@ test('子会话拿不到领导纪律段（否则侦察兵也会去派子智能�
   assert.ok(section.text({ agent: {} }).length > 0, '没有会话头也按领导处理')
 })
 
-test('纪律段：不自述过程、能力表不外露、理由只讲一次、模型名写进 description', () => {
+test('纪律段：选人理由是唯一允许的过程话、能力表不外露、模型名写进 description', () => {
   const text = mount({}).sections[0].text()
 
-  assert.match(text, /不自述过程/, '要明确禁止过程旁白')
+  // 选人理由是**唯一**允许的过程话；其余过程旁白仍禁止——两条合并成一条，免得模型
+  // 为了守「不自述过程」而把理由也一起省掉（实测就是这么发生的）。
+  assert.match(text, /只准说一句过程话：选人理由/)
+  assert.match(text, /唯一\*\*允许的过程话|这是\*\*唯一\*\*允许的过程话/)
   // 结论必须由子智能体产出：连简单问答也不许自己直接答（留寒暄与向用户追问两个例外）。
   assert.match(text, /结论不由你产出/)
   assert.match(text, /很简单的问答/)
@@ -223,7 +228,7 @@ test('纪律段：不自述过程、能力表不外露、理由只讲一次、�
   assert.match(text, /向用户追问/)
   assert.match(text, /能力表只留在你自己手里/)
   assert.match(text, /不要展示给用户/)
-  assert.match(text, /理由只讲一次/)
+  assert.match(text, /不要写「我先去取模型名册」/, '其余过程旁白仍要明确禁止')
   assert.match(text, /交付最终结果时不要再重复/)
   // 理由从「可选」改成「必须」：发出委派那一刻要说清为什么是它。
   assert.match(text, /发出委派那一刻/)
@@ -421,6 +426,42 @@ test('子会话出现时按发起方认领「模型 + 任务」写成标题（�
   // `{ global: true }` 会让同一事件被投递两次：认领已消费，所以不会重复命名。
   subagentStart({ runId: 'run-1', id: 'child-1' })
   assert.equal(mounted.renames.length, 1)
+})
+
+test('提示只点名这个 preset 真有的工具：没有 subagent 时绝不能叫它用 subagent', () => {
+  // 真机踩过：leader preset 只注册了 subagent_fork，而纪律段通篇写「用 subagent」，
+  // 模型照做 → 宿主 ToolNotFoundError: unknown tool "subagent"。
+  const forkOnly = mount({}, { toolNames: ['subagent_fork'] })
+  // 装配时宿主总会给 context（scope/agent），这里照真机传一个普通 agent
+  const text = forkOnly.sections[0].text({ agent: exec('read').agent })
+
+  assert.match(text, /选定后要显式传给 `subagent_fork`/)
+  assert.match(text, /本 preset 只有 `subagent_fork`/)
+  assert.ok(!/`subagent`/.test(text), '不能出现裸的 `subagent`——那会让模型去调一个不存在的工具')
+  // 名册工具也不存在：不能再叫它去查名册
+  assert.match(text, /本 preset 没有 `list_subagent_models`/)
+})
+
+test('被拒时指的也是真有的那个委派工具', async () => {
+  const forkOnly = mount({}, { toolNames: ['subagent_fork'] })
+  const decision = await forkOnly.listener('tools/pre-execute')(exec('read'), next)
+  assert.equal(decision.kind, 'deny')
+  assert.match(decision.reason, /`subagent_fork`/)
+  assert.ok(!/`subagent`/.test(decision.reason), '拒绝理由也不能点不存在的工具名')
+})
+
+test('子会话标题用短路线名：没指定模型时就是「默认路线 · 任务」', async () => {
+  const mounted = mount({})
+  const preExecute = mounted.listener('tools/pre-execute')
+  const subagentStart = mounted.listener('subagent/start')
+  mounted.children.set('child-1', { id: 'child-1', header: { parentSession: 'agent-0' } })
+
+  await readRoster(preExecute)
+  await preExecute(exec('subagent', 0, { description: '写鹈鹕', run_in_background: false }), next)
+  subagentStart({ id: 'child-1' })
+
+  // 标题上限 80 字节，塞不下「未指定 → 用配置的默认路线」那串；卡片上的长文案不在这里用。
+  assert.equal(mounted.renames[0].title, '默认路线 · 写鹈鹕')
 })
 
 test('没跑起来的委派会丢掉待认领项，不会张冠李戴', async () => {

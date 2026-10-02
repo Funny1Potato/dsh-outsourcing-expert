@@ -175,6 +175,33 @@ function selectionReason(reverse) {
     + '怎么正好接得住它——例如「困难档的长链路重构，v4-pro 是旗舰强推理，擅长这类活」。'
 }
 
+/**
+ * 这个会话到底该点哪个委派工具的名字。
+ *
+ * 各 preset 的工具集不同——用户的 `leader` preset **只注册了 `subagent_fork`，没有 `subagent`**；
+ * 提示里点名一个不存在的工具，模型就会直接去调它，宿主回 `ToolNotFoundError: unknown tool
+ * "subagent"`（2026-10-02 真机日志实测）。所以提示里只提真实存在的那个。
+ * @param {Set<string> | undefined} available - 本会话工具名；undefined 表示拿不到（此时不做过滤）
+ * @returns {{ main: string, hint: string }}
+ */
+function delegationNaming(available) {
+  const has = (tool) => available === undefined || available.has(tool)
+  const roster = has('list_subagent_models')
+  if (has('subagent')) {
+    return {
+      main: 'subagent',
+      roster,
+      hint: has('subagent_fork')
+        ? '需要你当前对话上下文时用 `subagent_fork`，全新独立子任务用 `subagent`。'
+        : '',
+    }
+  }
+  if (has('subagent_fork')) {
+    return { main: 'subagent_fork', roster, hint: '本 preset 只有 `subagent_fork`：独立子任务也用它。' }
+  }
+  return { main: 'subagent', roster, hint: '' }
+}
+
 /** 读出这次委派参数里的一个非空字符串字段。 */
 function delegationField(exec, key) {
   const raw = exec?.arguments
@@ -208,8 +235,23 @@ function delegationLabel(exec) {
 }
 
 /**
+ * 子会话标题里用的模型名：没指定就是「默认路线」。
+ * 标题上限只有 80 字节，卡片那行「未指定 → 用配置的默认路线」放在标题里太占地方
+ * （实测标题变成「未指定 → 用配置的默认路线 · 任务」，任务被挤掉）。
+ * @param {unknown} exec
+ * @returns {string}
+ */
+function shortRoute(exec) {
+  const provider = delegationField(exec, 'provider')
+  const model = delegationField(exec, 'model')
+  if (provider === undefined || model === undefined) return '默认路线'
+  const effort = delegationField(exec, 'reasoning_effort')
+  return `${provider} / ${model}${effort === undefined ? '' : `（effort ${effort}）`}`
+}
+
+/**
  * 写进子会话标题的文本：**模型在前**（标题上限 80 字节，截断时先丢任务），再接任务。
- * @param {string} route - 本次委派的模型（或「未指定」的兜底文案）
+ * @param {string} route - 本次委派的模型（或「默认路线」）
  * @param {string | undefined} task - 本次委派的任务（`description`）
  * @returns {string}
  */
@@ -464,7 +506,7 @@ const DELEGATION_FORMAT = '**每次委派的 `description` 都要以模型开头
  * @param {boolean} hasCache - 是否已有缓存（决定「表里没有的模型怎么办」那句怎么写）
  * @returns {string}
  */
-function hiringSteps(reverse, escalateOnFailure, hasCache) {
+function hiringSteps(reverse, escalateOnFailure, hasCache, naming) {
   // 有缓存时不能再说「也就是 list_subagent_models 报过的模型里」——那张表是缓存来的，
   // 这个会话根本没调过名册。
   const scope = hasCache
@@ -479,21 +521,33 @@ function hiringSteps(reverse, escalateOnFailure, hasCache) {
 2. **按能力表选人**：${selectionRule(reverse)}
    ${scope}
    ${fallback}
-   **选定后要显式传给 \`subagent\`**（\`provider\` + \`model\`，必要时带 \`reasoning_effort\`），
+   **选定后要显式传给 \`${naming.main}\`**（\`provider\` + \`model\`，必要时带 \`reasoning_effort\`），
    并按上面的格式把它写进 \`description\`——只在心里想、不写进调用参数，等于没选：
    模型会走默认路线，卡片上也看不到。
 ${escalateOnFailure
     ? '3. **失败升级**：某个委派失败或明显没做好时，允许**换更高一档的模型重试一次**；\n'
       + '   第二次仍失败就停下来向用户汇报，不要无限重试。\n'
       + '4. '
-    : '3. '}**并行优先**：\`subagent\` 默认后台运行（\`run_in_background\` 默认 true），结果落定时
+    : '3. '}**并行优先**：\`${naming.main}\` 默认后台运行（\`run_in_background\` 默认 true），结果落定时
    你会收到通知——相互独立的活一次派出去、别串行干等；只有下一步确实依赖某个结果时才传
    \`run_in_background: false\`。**有前台委派在飞的时候新的委派会被拦下**，那说明你本该用
-   后台。需要你当前对话上下文时用 \`subagent_fork\`，全新独立子任务用 \`subagent\`。`
+   后台。${naming.hint}`
 }
 
 /** 还没有缓存时的「用人」部分：先侦察，再派活。 */
-function reconPlan(reverse, escalateOnFailure) {
+function reconPlan(reverse, escalateOnFailure, naming) {
+  // 名册工具不一定存在（leader preset 就没有）：那时候不能叫它去查名册，否则又是一次
+  // 「unknown tool」。代码里的那道门也会跟着自动让开（hasTool 检查）。
+  const gateRoster = naming.roster
+    ? '1. **先查名册**：还没调过 \`list_subagent_models\` 就发第一条委派，会被拒绝——名册是侦察\n   的前提，也是你之后贴给侦察兵的清单。'
+    : '1. **本 preset 没有 \`list_subagent_models\`**：跳过查名册，直接用你已知的模型名当清单。'
+  const stepRoster = naming.roster
+    ? '1. **取名册**：调 \`list_subagent_models\`（无参数 → 已授权的 provider 列表；再按 provider\n'
+      + '   逐个查它公布的模型）。把返回的**完整模型清单**抄下来。该工具不可用、或没列出任何模型时：\n'
+      + '   **不要瞎猜**——跳过侦察，把 \`provider\` / \`model\` / \`reasoning_effort\` 全部省略交给\n'
+      + '   默认路线。'
+    : '1. **清单从哪来**：本 preset 没有 \`list_subagent_models\`，就用你已知的模型名当清单；'
+      + '实在\n   列不出来，就把 \`provider\` / \`model\` / \`reasoning_effort\` 全省略、交给默认路线。'
   return `## 用人两步走：先摸清人选，再决定派谁
 
 ${DELEGATION_FORMAT}
@@ -504,18 +558,14 @@ ${DELEGATION_FORMAT}
 
 ⚠ **两道顺序是硬的，做不到会被当场拦下**：
 
-1. **先查名册**：还没调过 \`list_subagent_models\` 就发第一条委派，会被拒绝——名册是侦察
-   的前提，也是你之后贴给侦察兵的清单。
+${gateRoster}
 2. **侦察必须前台**：传 \`run_in_background: false\` 当场等结果，而且**那一轮只发这一次
    委派**——不要在同一轮里顺手把干活的活也派出去。
 
-1. **取名册**：调 \`list_subagent_models\`（无参数 → 已授权的 provider 列表；再按 provider
-   逐个查它公布的模型）。把返回的**完整模型清单**抄下来。该工具不可用、或没列出任何模型时：
-   **不要瞎猜**——跳过侦察，把 \`provider\` / \`model\` / \`reasoning_effort\` 全部省略交给
-   默认路线。
+${stepRoster}
 2. **随机挑一个当侦察兵**：从这份清单里**随机**选一个模型，不要挑「看起来最强」的。
    这一轮不按难度选人——它的任务是调研，不是干正事。
-3. **派它去联网调研**（用 \`subagent\`，并显式传入你随机挑中的那个 \`provider\` / \`model\`）：
+3. **派它去联网调研**（用 \`${naming.main}\`，并显式传入你随机挑中的那个 \`provider\` / \`model\`）：
    - **这一轮必须传 \`run_in_background: false\`**——你的下一步（决定派谁）依赖它的结果，
      要当场等它返回；
    - 把**完整的可选模型清单**贴进委派提示——它看不到你手上的这份清单；
@@ -535,11 +585,11 @@ ${DELEGATION_FORMAT}
 
 ### 之后每一轮：按能力表派活
 
-${hiringSteps(reverse, escalateOnFailure, false)}`
+${hiringSteps(reverse, escalateOnFailure, false, naming)}`
 }
 
 /** 已有缓存时的「用人」部分：直接用表，不再侦察；表正文附在本节末尾。 */
-function cachedPlan(reverse, escalateOnFailure, cache) {
+function cachedPlan(reverse, escalateOnFailure, cache, naming) {
   return `## 用人：直接按缓存的能力表派活
 
 ${DELEGATION_FORMAT}
@@ -549,7 +599,7 @@ ${DELEGATION_FORMAT}
 
 ### 按能力表派活
 
-${hiringSteps(reverse, escalateOnFailure, true)}
+${hiringSteps(reverse, escalateOnFailure, true, naming)}
 
 ## 本机缓存的能力表（${formatCacheDate(cache)}）
 
@@ -575,7 +625,7 @@ ${retry}你自己无法核验的部分（读文件、跑命令）只能靠「再
  * @param {{ models?: unknown[], raw?: string, updatedAt?: string, source?: string } | undefined} cache - 当前缓存
  * @returns {string}
  */
-function discipline(reverse, escalateOnFailure, allowList, cache) {
+function discipline(reverse, escalateOnFailure, allowList, cache, naming) {
   return [
     `# 外包高手：委派纪律
 
@@ -588,27 +638,29 @@ ${allowList().map(tool => `- \`${tool}\``).join('\n')}
 遇到拦截不要重试，改成委派。`,
     `## 说话方式
 
-- **不自述过程**：不要写「我先去取模型名册」「我现在派一个子智能体去调研」「接下来我会…」
-  这类过程旁白，也不要复述本纪律。直接做，做完直接给结果。
+- **只准说一句过程话：选人理由**：每次选定模型、发出委派那一刻，**必须**用一句话说清为什么是它
+  ——这是**唯一**允许的过程话；**交付最终结果时不要再重复**。除此之外不要写「我先去取模型名册」
+  「我现在派一个子智能体去调研」「接下来我会…」这类旁白，也不要复述本纪律，直接做、做完直接给结果。
+${selectionReason(reverse)}
 - **结论不由你产出**：哪怕是很简单的问答（「怎么装」「这是什么」「帮我算一下」），也不要
-  自己直接答——先派 \`subagent\` 去查、去答，拿到它的结论再转述给用户。可以直接接的只有
+  自己直接答——先派 \`${naming.main}\` 去查、去答，拿到它的结论再转述给用户。可以直接接的只有
   两类：纯寒暄与确认、以及**向用户追问**（要用户补信息，最好用 \`ask_user_question\`）。
-- **理由只讲一次**：每次选定模型、发出委派那一刻，**必须**用一句话说清为什么是它；
-  **交付最终结果时不要再重复**。
-${selectionReason(reverse)}`,
+  同样的，**不要自己在正文里替子智能体做推导、算数字或下判定**——要核实就再派一个子智能体核。`,
     `## 目标（goal）必须先问下属再定
 
 \`get_goal\` / \`create_goal\` / \`update_goal\` **只属于你**（子 Agent 调会被服务拒绝），
 所以**你不能自己拍脑袋定目标**。定目标前：
 
-1. **先派一个 subagent**，在委派提示里写清任务背景、用户诉求、你初步想到的可能目标，
+1. **先派一个 \`${naming.main}\`**，在委派提示里写清任务背景、用户诉求、你初步想到的可能目标，
    并要求它**评估并给出建议的目标**：一句话 objective、max_goal_rounds、以及为什么这样定
    （它会用 \`web_search\`、\`read\` 等工具自己调研）。
 2. **等它返回**，把它建议的目标、理由与 max_goal_rounds 原样带回。
 3. **你再调 \`create_goal\`** 登记。
 
 跳过第 1 步直接 \`create_goal\` 属于越权。`,
-    cache === undefined ? reconPlan(reverse, escalateOnFailure) : cachedPlan(reverse, escalateOnFailure, cache),
+    cache === undefined
+      ? reconPlan(reverse, escalateOnFailure, naming)
+      : cachedPlan(reverse, escalateOnFailure, cache, naming),
     selfCheck(escalateOnFailure),
   ].join('\n\n')
 }
@@ -668,7 +720,7 @@ export function apply(ctx, config = {}) {
 
   const rememberDelegation = (agentId, exec) => {
     const queue = pendingClaims.get(agentId) ?? []
-    queue.push({ route: delegationRoute(exec), task: delegationTask(exec) })
+    queue.push({ route: shortRoute(exec), task: delegationTask(exec) })
     // 只用于配对，压到 4 条就够，异常路径下也不会无限长。
     pendingClaims.set(agentId, queue.slice(-4))
   }
@@ -678,6 +730,18 @@ export function apply(ctx, config = {}) {
     const claim = queue?.shift()
     if (queue !== undefined && queue.length === 0) pendingClaims.delete(agentId)
     return claim
+  }
+
+  /** 本会话真实存在的工具名集合；拿不到就返回 undefined（此时提示不做过滤，宁可多列）。 */
+  const availableTools = (agent) => {
+    try {
+      const names = ctx.tools.schemas(agent)
+        .map(schema => schema?.name)
+        .filter(name => typeof name === 'string' && name !== '')
+      return names.length > 0 ? new Set(names) : undefined
+    } catch {
+      return undefined
+    }
   }
 
   /** 某个工具在当前 preset 的 schema 里有没有（用它判断「这组合里到底有没有这个工具」）。 */
@@ -811,8 +875,8 @@ export function apply(ctx, config = {}) {
     return {
       kind: 'deny',
       reason: `【外包高手】你不亲自调用「${toolName}」。你只负责提问、拆解、定目标与委派：`
-        + '请改用 `subagent`（全新独立子任务）或 `subagent_fork`（需要你当前对话上下文的'
-        + '子任务）把这件事外包出去。',
+        + `请改用 \`${delegationNaming(availableTools(agent)).main}\` 把这件事外包出去。`
+        + delegationNaming(availableTools(agent)).hint,
     }
   })
 
@@ -881,7 +945,14 @@ export function apply(ctx, config = {}) {
     text: (context = {}) => {
       const agent = context.agent ?? context.scope
       if (isSubagent(agent)) return ''
-      return discipline(reverseHiring, escalateOnFailure, () => [...allowTools], readCache())
+      // 提示里只列**这个 preset 真有的**工具与委派工具名：点名一个不存在的工具，模型会
+      // 直接去调它，宿主回 `ToolNotFoundError: unknown tool "subagent"`（真机实测）。
+      const available = availableTools(agent)
+      const naming = delegationNaming(available)
+      const listed = available === undefined
+        ? [...allowTools]
+        : [...allowTools].filter(tool => available.has(tool))
+      return discipline(reverseHiring, escalateOnFailure, () => listed, readCache(), naming)
     },
   })
 
