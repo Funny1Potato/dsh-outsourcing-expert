@@ -17,7 +17,7 @@
 
 A DSH (DeepSeek Harness) plugin bundle that declares two agent presets in which the top-level agent does no work itself. Every non-management tool call (`read`, `write`, `pwsh`, `web_search`, `workflow`, `skill`, …) is **denied at the harness boundary**, so the task has to go to a subagent, and the chosen provider and model have to be named in each delegation. Before the first delegation the leader must look up the available subagent models and research them once; that research is cached at `<DSH_HOME>/outsourcing-expert/models.json` and inlined into the system prompt from then on, so later sessions skip it entirely — while no cache exists, a delegation without a roster lookup, or a first delegation not run in the foreground, is refused at the harness boundary. A second preset, `outsourcing-expert-reverse`, deliberately picks the model least suited to the task.
 
-Install: `dsh plugin --profile <profile> add github:Funny1Potato/dsh-outsourcing-expert`, then start a new session and pick 外包高手. Only the two presets this bundle declares are affected; other presets are untouched.
+Install: `dsh plugin --profile <profile> add dsh-outsourcing-expert` (or from GitHub: `github:Funny1Potato/dsh-outsourcing-expert`), then start a new session and pick 外包高手. Only the two presets this bundle declares are affected; other presets are untouched.
 
 ## 它做什么
 
@@ -85,7 +85,13 @@ Install: `dsh plugin --profile <profile> add github:Funny1Potato/dsh-outsourcing
 
 ## 安装与启用
 
-从 GitHub 装（发布在 <https://github.com/Funny1Potato/dsh-outsourcing-expert>；包里没有 `prepare` / `build` 脚本，源码安装不需要 `allowBuilds` 授权）：
+从 npm 装（<https://www.npmjs.com/package/dsh-outsourcing-expert>）：
+
+```sh
+dsh plugin --profile <profile> add dsh-outsourcing-expert
+```
+
+从 GitHub 装也可以（包里没有 `prepare` / `build` 脚本，源码安装不需要 `allowBuilds` 授权）：
 
 ```sh
 dsh plugin --profile <profile> add github:Funny1Potato/dsh-outsourcing-expert
@@ -97,7 +103,7 @@ dsh plugin --profile <profile> add github:Funny1Potato/dsh-outsourcing-expert
 dsh plugin --profile <profile> add link:<本目录绝对路径>
 ```
 
-Desktop 端走界面最省事（**插件 → 添加插件**，填 `github:Funny1Potato/dsh-outsourcing-expert`、本地目录绝对路径或 `link:<路径>`）；要用命令行管 `desktop` profile，得用桌面端**自带的那份** `dsh`（`where dsh` 里排第一的那个），别的 dsh 安装会被拒（`profile "desktop" is managed exclusively by the Electron application`）。装完后**新建会话**，在 preset 选择里选「外包高手」或「外包高手（独具慧眼）」。
+Desktop 端走界面最省事（**插件 → 添加插件**，填包名 `dsh-outsourcing-expert`，或 GitHub 名、本地目录绝对路径、`link:<路径>`）；要用命令行管 `desktop` profile，得用桌面端**自带的那份** `dsh`（`where dsh` 里排第一的那个），别的 dsh 安装会被拒（`profile "desktop" is managed exclusively by the Electron application`）。装完后**新建会话**，在 preset 选择里选「外包高手」或「外包高手（独具慧眼）」。
 
 ## 文件
 
