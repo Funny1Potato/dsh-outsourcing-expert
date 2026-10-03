@@ -2,24 +2,27 @@
 
 [![CI](https://github.com/Funny1Potato/dsh-outsourcing-expert/actions/workflows/ci.yml/badge.svg)](https://github.com/Funny1Potato/dsh-outsourcing-expert/actions/workflows/ci.yml)
 
-一个 DSH 插件包：声明两个 agent preset，把「领导」变成**不亲自干活、把活全外包出去**的角色——先摸清可选模型各自擅长什么，再按任务的难度与类型决定每一件活交给谁。
+一个 DSH 插件包：声明三个 agent preset。其中两个把「领导」变成**不亲自干活、把活全外包出去**的角色——先摸清可选模型各自擅长什么，再按任务的难度与类型决定每一件活交给谁；第三个「领导模式」则是**执行者 + 委派者**（自己也能干活），插件只给它注入全局能力表。
 
 | preset | id | 选人规则 |
 | --- | --- | --- |
 | **外包高手** | `outsourcing-expert` | 能力对齐：先按**任务类型**挑「擅长」命中该类的模型，再按**难度**定档——简单 →轻量快速，中等 →均衡，困难 →代码专精或强推理，极难 →旗舰强推理 |
 | **外包高手（独具慧眼）** | `outsourcing-expert-reverse` | 故意反着来：照能力表「不适合什么」那栏挑，**专挑干不了这个任务**的模型 |
+| **领导模式** | `leader` | 自己的纪律 + 全局能力表：保留「执行者 + 委派者」的身份，能自己高效完成的事自己做；委派时判档优先照全局能力表（表外模型按原有的发现 / 联网核实流程） |
 
-两个 preset 只差插件行配置里的 `reverseHiring`；**没有运行时开关**，选哪个就是哪个。
+外包高手两个 preset 只差插件行配置里的 `reverseHiring`，**没有运行时开关**，选哪个就是哪个；领导模式是第三份 preset（插件行 `mode: leader`），**不硬拦截干活工具**，插件只注入能力表。
 
-**只在使用这两个 preset 的会话里生效**：preset 的 `plugins` 挂在该 preset 自己的 scope 下，scope 化的拦截器与提示段由宿主按会话过滤；别的 preset（standard、ptc、`leader`…）的会话完全看不到。
+**只在使用这三个 preset 的会话里生效**：preset 的 `plugins` 挂在该 preset 自己的 scope 下，scope 化的拦截器与提示段由宿主按会话过滤；别的 preset（standard、ptc…）的会话完全看不到。
 
 ## English summary
 
-A DSH (DeepSeek Harness) plugin bundle that declares two agent presets in which the top-level agent does no work itself. Every non-management tool call (`read`, `write`, `pwsh`, `web_search`, `workflow`, `skill`, …) is **denied at the harness boundary**, so the task has to go to a subagent, and the chosen provider and model have to be named in each delegation. Before the first delegation the leader must look up the available subagent models and research them once; that research is cached at `<DSH_HOME>/outsourcing-expert/models.json` and inlined into the system prompt from then on, so later sessions skip it entirely — while no cache exists, a delegation without a roster lookup, or a first delegation not run in the foreground, is refused at the harness boundary. A second preset, `outsourcing-expert-reverse`, deliberately picks the model least suited to the task.
+A DSH (DeepSeek Harness) plugin bundle that declares three agent presets. Two of them — `outsourcing-expert` and `outsourcing-expert-reverse` — make the top-level agent do no work itself: every non-management tool call (`read`, `write`, `pwsh`, `web_search`, `workflow`, `skill`, …) is **denied at the harness boundary**, so the task has to go to a subagent, and the chosen provider and model have to be named in each delegation. Before the first delegation the leader must look up the available subagent models and research them once; that research is cached at `<DSH_HOME>/outsourcing-expert/models.json` and inlined into the system prompt from then on, so later sessions skip it entirely — while no cache exists, a delegation without a roster lookup, or a first delegation not run in the foreground, is refused at the harness boundary. `outsourcing-expert-reverse` deliberately picks the model least suited to the task. The third preset, `leader` (领导模式), keeps the standard mode's identity (it may do work itself, nothing is denied) and keeps its own discovery/tiering/web-verification discipline; the plugin only injects the same global capability table (and builds it when empty) into its prompt.
 
-Install: `dsh plugin --profile <profile> add dsh-outsourcing-expert` (or from GitHub: `github:Funny1Potato/dsh-outsourcing-expert`), then start a new session and pick 外包高手. Only the two presets this bundle declares are affected; other presets are untouched.
+Install: `dsh plugin --profile <profile> add dsh-outsourcing-expert` (or from GitHub: `github:Funny1Potato/dsh-outsourcing-expert`), then start a new session and pick 外包高手, 外包高手（独具慧眼） or 领导模式. Only the three presets this bundle declares are affected; other presets are untouched.
 
 ## 它做什么
+
+> 以下 1–5 节描述**外包高手**两个 preset（`mode` 缺省）。**领导模式**（`mode: leader`）不硬拦截、也不搬这套纪律，见第 6 节。
 
 ### 1. 硬拦截（`tools/pre-execute` 瀑布）
 
@@ -83,6 +86,15 @@ Install: `dsh plugin --profile <profile> add dsh-outsourcing-expert` (or from Gi
 
 子任务失败或明显没做好时，允许**换更高一档的模型重试一次**；第二次仍失败就停下来向用户汇报，不无限重试。
 
+### 6. 领导模式（第三个 preset）：只加能力表，纪律保持原样
+
+「领导模式」**不搬外包高手那套纪律**：它自己是执行者也是委派者，`read` / `write` / `web_search` 等干活工具**不被拦截**；它的选模纪律（发现 → 判档 → 联网核实 → 内置启发式对照表）完整保留在 persona 里。插件只做两件事：
+
+- 本机有能力表缓存时，把表内联进提示段，并说明「判档优先照表，表里没覆盖的模型再按原有的发现 / 联网核实流程」；
+- 本机还没有缓存时，提示段给出建表流程（查名册 → 前台派一个侦察兵联网调研 → 结果自动缓存），建好之前选模仍按它自己的流程走。
+
+建表与缓存机制和外包高手**完全共用**：同一个 `<DSH_HOME>/outsourcing-expert/models.json`，三个 preset 共用一份。
+
 ## 安装与启用
 
 从 npm 装（<https://www.npmjs.com/package/dsh-outsourcing-expert>）：
@@ -103,14 +115,14 @@ dsh plugin --profile <profile> add github:Funny1Potato/dsh-outsourcing-expert
 dsh plugin --profile <profile> add link:<本目录绝对路径>
 ```
 
-Desktop 端走界面最省事（**插件 → 添加插件**，填包名 `dsh-outsourcing-expert`，或 GitHub 名、本地目录绝对路径、`link:<路径>`）；要用命令行管 `desktop` profile，得用桌面端**自带的那份** `dsh`（`where dsh` 里排第一的那个），别的 dsh 安装会被拒（`profile "desktop" is managed exclusively by the Electron application`）。装完后**新建会话**，在 preset 选择里选「外包高手」或「外包高手（独具慧眼）」。
+Desktop 端走界面最省事（**插件 → 添加插件**，填包名 `dsh-outsourcing-expert`，或 GitHub 名、本地目录绝对路径、`link:<路径>`）；要用命令行管 `desktop` profile，得用桌面端**自带的那份** `dsh`（`where dsh` 里排第一的那个），别的 dsh 安装会被拒（`profile "desktop" is managed exclusively by the Electron application`）。装完后**新建会话**，在 preset 选择里选「外包高手」「外包高手（独具慧眼）」或「领导模式」。
 
 ## 文件
 
 | 文件 | 作用 |
 | --- | --- |
-| `cordis.patch.yml` | 唯一的 patch 层：插入两条 `@deepseek-ai/dsh-agent-preset` 声明。两份花名册都以官方 standard preset 为底（原样照抄），只差最后那行插件的 `reverseHiring`——**改花名册时两处一起改** |
-| `src/index.js` | 可执行半侧：拦截、顺序纪律、纪律段、能力表缓存的读写与三条 `/outsourcing-models*` 命令（两个 preset 共用同一份代码） |
+| `cordis.patch.yml` | 唯一的 patch 层：插入三条 `@deepseek-ai/dsh-agent-preset` 声明。三份花名册都以官方 standard preset 为底（原样照抄），只差最后那行插件的 `config`（`reverseHiring` / `mode`）——**改花名册时三处一起改** |
+| `src/index.js` | 可执行半侧：拦截、顺序纪律、纪律段、能力表缓存的读写与三条 `/outsourcing-models*` 命令（三个 preset 共用同一份代码，按插件行 `config.mode` 分行为） |
 | `tests/contract.test.mjs` | 契约测试（记录型 ctx 桩，不依赖宿主） |
 | `LICENSE` | MIT |
 
@@ -119,7 +131,8 @@ Desktop 端走界面最省事（**插件 → 添加插件**，填包名 `dsh-out
 | 键 | 类型 | 说明 |
 | --- | --- | --- |
 | `allowTools` | `string[]` | **追加**到内置白名单的工具名（只能加，不能减） |
-| `reverseHiring` | `bool` | `false`=按类型与难度挑最合适的，`true`=照「不适合什么」挑最不合适的。**两个 preset 唯一的差别** |
+| `reverseHiring` | `bool` | 外包高手用：`false`=按类型与难度挑最合适的，`true`=照「不适合什么」挑最不合适的。**外包高手两个 preset 唯一的差别** |
+| `mode` | `'outer' \| 'leader'` | `outer`（缺省）=外包高手：硬拦截干活工具、搬全套纪律；`leader`=领导模式：不拦截，插件只注入能力表（纪律留在 persona） |
 | `escalateOnFailure` | `bool` | 失败后是否允许升级模型重试一次（提示层规则） |
 | `capabilityCache` | `bool` | 默认 `true`。`false` = 不读写能力表缓存，退回「每个会话各自侦察一次」（两道代码门仍在） |
 | `storeDir` | `string` | 缓存目录（放着 `models.json` 的那个目录）。默认 `<DSH_HOME>/outsourcing-expert` |
@@ -132,10 +145,10 @@ node --test        # 契约测试：导出形状、提示段字段、拒绝形�
 
 ## 已知限制
 
-- **硬拦截意味着领导只能问、只能拆、只能委派**，不能自己动手。想退化成纯提示词模式，把 `src/index.js` 里 `tools/pre-execute` 的 `return { kind: 'deny', ... }` 改成 `return next()` 即可。
+- **硬拦截只作用于外包高手两个 preset**：领导模式（`mode: leader`）自己是执行者，干活工具不拦，插件只注入能力表。想让外包高手退化成纯提示词模式，把 `src/index.js` 里 `tools/pre-execute` 的 `return { kind: 'deny', ... }` 改成 `return next()` 即可。
 - **第一轮侦察只需一次**（本机没有缓存时），之后走缓存。但缓存的**质量取决于那一次侦察兵**：它是模型写的表，可能不准；而且换 provider / 加模型后表会过时——`/outsourcing-models-init` 清掉并当场重新侦察。
-- **缓存是机器级全局的一份**（`AssembleContext` 只给 `{ scope, signal }`，拿不到会话与工作区，所以也只能是全局）。同一台机器上的所有工作区、两个 preset 共用它。
+- **缓存是机器级全局的一份**（`AssembleContext` 只给 `{ scope, signal }`，拿不到会话与工作区，所以也只能是全局）。同一台机器上的所有工作区、三个 preset 共用它。
 - **侦察结果格式不达标就不会被缓存**：体检要求「≥2 行含 `provider/model` 且出现能力档位词」。达不到就只是这一次会话没有表，下个会话还得重来（不会写坏缓存）。
 - **选人规则是提示层，不是运行时强制**。宿主的 `tools/pre-execute` **明确排除「改写参数」**（参数此刻已记入日志并展示给用户），插件无法在派发前替领导把 `provider` / `model` 改掉。要真正做到「插件接管选人」，得自己注册一个委派工具并用 `ctx.subagents.start({ agentOptions })` 固定路由——那是另一套实现。
-- **两个 preset 都是 native 工具模式**，不涉及 PTC。若拿这份花名册去搭 ptc preset，记得把 `run_code` 加进 `allowTools`（否则领导的唯一原生入口也被拦掉）。
+- **外包高手两个 preset 都是 native 工具模式**，不涉及 PTC。若拿这份花名册去搭 ptc preset，记得把 `run_code` 加进 `allowTools`（否则领导的唯一原生入口也被拦掉）。
 - **运行中的会话不会自动拿到新配置**：改代码或 `cordis.patch.yml` 后需重启 host（或在插件页停用再启用）；已存在的会话保持它创建时的 preset 组合，要**新建会话**才生效。

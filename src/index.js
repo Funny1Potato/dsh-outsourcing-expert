@@ -738,14 +738,53 @@ ${retry}你自己无法核验的部分（读文件、跑命令）只能靠「再
 }
 
 /**
+ * 「领导模式」的注入段：**只给能力表**（以及空表时的建表流程）。领导模式自己的纪律
+ * 在 preset 的 persona 里（发现 / 判档 / 联网核实 / 启发式对照表），插件不碰、也不把
+ * 外包高手的纪律搬进来——这里只是把全局能力表交到它手上。
+ * @param {{ models?: unknown[], raw?: string, updatedAt?: string, source?: string } | undefined} cache - 当前缓存
+ * @param {{ main: string, fork: string, hint: string, roster?: boolean }} naming - 委派工具名
+ * @returns {string}
+ */
+function leaderTable(cache, naming) {
+  if (cache === undefined) {
+    // 名册工具不一定存在（某些 preset 组合没有）：没有时不能用它来发现模型，只能靠
+    // 侦察兵用已知模型名建表（代码里的那道门也会自动让开，见 hasTool 检查）。
+    const roster = naming.roster
+      ? '1. 调 \`list_subagent_models\` 拿名册（**参数整个省略**——写成空字符串会被拒；无参数 → 已授权\n'
+        + '   的 provider 列表，再按 provider 逐个查它公布的模型），把**完整清单**抄下来（provider 名\n'
+        + '   照抄，别换成模型的真实厂商）；\n'
+      : '1. 本 preset 没有 \`list_subagent_models\`，用你已知的模型名当清单；\n'
+    return `## 能力表（本机还没有）
+
+本机还没有能力表缓存，第一次委派前先建一次（建好自动缓存到本机，之后所有会话直接复用）：
+
+${roster}2. 用 \`${naming.main}\` 派一个侦察兵去联网调研（\`run_in_background: false\` 当场等结果，那一轮只发
+   这一次委派）：把清单贴给它，让它自己用 \`web_search\` 查每个模型「擅长什么、适合哪类任务、
+   评测/口碑如何」并附来源链接，**不要再往下委派**（会撞委派深度上限）；
+3. 侦察结果会自动缓存成能力表。建好之前，选模仍按你原有的发现 / 判档 / 联网核实流程走。`
+  }
+  return `## 本机缓存的能力表（侦察时间：${formatCacheDate(cache)}）
+
+选模判档**优先照这张表**——它是联网调研过的真实能力档位，比名称启发式可靠；表里没有覆盖到的
+模型，再按你原有的发现（\`list_subagent_models\`）与联网核实流程处理。这张表是全局的，
+之后所有会话直接复用，不用重新侦察。
+
+${renderCache(cache)}`
+}
+
+/**
  * 纪律段正文。`text` 是函数，每次装配重新拼：白名单跟着配置走，能力表跟着缓存文件走。
  * @param {boolean} reverse - 是否反向用人
  * @param {boolean} escalateOnFailure - 失败后是否允许升级模型重试一次
  * @param {() => string[]} allowList
  * @param {{ models?: unknown[], raw?: string, updatedAt?: string, source?: string } | undefined} cache - 当前缓存
+ * @param {{ main: string, fork: string, hint: string, roster?: boolean }} naming
+ * @param {boolean} [leaderMode] - 领导模式（执行者+委派者）还是外包高手（纯委派）
  * @returns {string}
  */
-function discipline(reverse, escalateOnFailure, allowList, cache, naming) {
+function discipline(reverse, escalateOnFailure, allowList, cache, naming, leaderMode = false) {
+  // 领导模式只加能力表，纪律留在它自己的 persona 里。
+  if (leaderMode) return leaderTable(cache, naming)
   return [
     `# 外包高手：委派纪律
 
@@ -786,11 +825,12 @@ ${selectionReason(reverse)}
 }
 
 /**
- * 挂载「外包高手」。
+ * 挂载「外包高手 / 领导模式」。
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {{
  *   allowTools?: string[], reverseHiring?: boolean, escalateOnFailure?: boolean,
  *   capabilityCache?: boolean, storeDir?: string,
+ *   mode?: 'outer' | 'leader',
  * }} [config]
  */
 export function apply(ctx, config = {}) {
@@ -798,6 +838,8 @@ export function apply(ctx, config = {}) {
   const reverseHiring = settings.reverseHiring === true
   const escalateOnFailure = settings.escalateOnFailure !== false
   const cacheEnabled = settings.capabilityCache !== false
+  // 领导模式：自己是执行者也是委派者（不硬拦截干活工具）；外包高手：纯委派（拦掉所有干活工具）。
+  const leaderMode = settings.mode === 'leader'
   const extraAllowed = Array.isArray(settings.allowTools)
     ? settings.allowTools.filter(tool => typeof tool === 'string' && tool.length > 0)
     : []
@@ -968,6 +1010,7 @@ export function apply(ctx, config = {}) {
 
     const agent = exec?.agent
     const leader = agent !== undefined && !isSubagent(agent)
+    const modeLabel = leaderMode ? '领导模式' : '外包高手'
 
     // 名册一到手就记下：缓存为空时那道「先查名册再委派」的门据此放行。
     // 在 pre-execute 记（而不是等它成功）是因为模型常把「取名册」和「派侦察兵」放在
@@ -985,7 +1028,7 @@ export function apply(ctx, config = {}) {
       if (needsRecon && first && !rosterRead.has(id) && hasTool(agent, ROSTER_TOOL)) {
         return {
           kind: 'deny',
-          reason: '【外包高手】本机还没有模型能力表缓存，而你还没查过名册：先调 '
+          reason: `【${modeLabel}】本机还没有模型能力表缓存，而你还没查过名册：先调 `
             + '`list_subagent_models` 把可选模型清单拿到手，再发第一条委派（那一条就是侦察）。'
             + '侦察结果会被自动缓存到本机，之后所有会话都不用再侦察。',
         }
@@ -993,7 +1036,7 @@ export function apply(ctx, config = {}) {
       if (foregroundInFlight.has(id)) {
         return {
           kind: 'deny',
-          reason: '【外包高手】你有一条前台委派还在跑，先等它返回再派下一条。需要并行的活请'
+          reason: `【${modeLabel}】你有一条前台委派还在跑，先等它返回再派下一条。需要并行的活请`
             + '用 `run_in_background: true`（后台）分开派，不要和前台委派挤在同一轮里。',
         }
       }
@@ -1001,7 +1044,7 @@ export function apply(ctx, config = {}) {
       if (needsRecon && first && !foreground) {
         return {
           kind: 'deny',
-          reason: '【外包高手】第一轮侦查必须先做、而且必须当场等结果：这次委派请传 '
+          reason: `【${modeLabel}】第一轮侦查必须先做、而且必须当场等结果：这次委派请传 `
             + '`run_in_background: false`，并且那一轮只发这一次委派。拿到能力表之后再进入'
             + '正常派活。',
         }
@@ -1017,6 +1060,8 @@ export function apply(ctx, config = {}) {
 
     if (allowTools.has(toolName)) return next()
     if (agent === undefined || isSubagent(agent)) return next()
+    // 领导模式自己是执行者：干活工具不拦（外包高手才需要把领导锁死成纯委派）。
+    if (leaderMode) return next()
 
     return {
       kind: 'deny',
@@ -1107,7 +1152,7 @@ export function apply(ctx, config = {}) {
       const listed = available === undefined
         ? [...allowTools]
         : [...allowTools].filter(tool => available.has(tool))
-      return discipline(reverseHiring, escalateOnFailure, () => listed, readCache(), naming)
+      return discipline(reverseHiring, escalateOnFailure, () => listed, readCache(), naming, leaderMode)
     },
   })
 

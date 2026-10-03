@@ -307,6 +307,75 @@ test('领导调用干活工具被拒，且拒绝形状是 kind:deny', async () =
   }
 })
 
+test('领导模式：干活工具不被硬拦截（自己是执行者），委派仍受「先查名册」门约束', async () => {
+  const { listener } = mount({ mode: 'leader' })
+  const preExecute = listener('tools/pre-execute')
+
+  // 领导模式自己是执行者：读文件、跑命令、上网……全放行
+  for (const toolName of ['read', 'write', 'edit', 'pwsh', 'bash', 'web_search', 'workflow', 'skill']) {
+    assert.equal(await preExecute(exec(toolName), next), ALLOWED, `${toolName} 不该被拦`)
+  }
+
+  // 但缓存为空 + 没查名册 → 委派仍被「先查名册」那道门拦下（能力表是全局的，建表流程共用）
+  const denied = await preExecute(exec('subagent', 0, { run_in_background: false }), next)
+  assert.equal(denied.kind, 'deny')
+  assert.match(denied.reason, /list_subagent_models/)
+  assert.match(denied.reason, /领导模式/)
+
+  await readRoster(preExecute)
+  assert.equal(await preExecute(exec('subagent', 0, { run_in_background: false }), next), ALLOWED)
+})
+
+test('领导模式：注入段只给能力表（空表时是建表流程），不带任何外包高手的纪律', () => {
+  const { sections } = mount({ mode: 'leader' })
+  const text = sections[0].text()
+  // 只加能力表：空缓存时是「先建表」的流程说明
+  assert.match(text, /能力表/)
+  assert.match(text, /list_subagent_models/)
+  assert.match(text, /侦察兵/)
+  assert.match(text, /web_search/)
+  // 外包高手的纪律一个都不能混进来：硬拦截、结论外包、目标先问下属、选人理由过程话……
+  assert.doesNotMatch(text, /外包高手/)
+  assert.doesNotMatch(text, /你不亲自做任何事/)
+  assert.doesNotMatch(text, /结论不由你产出/)
+  assert.doesNotMatch(text, /目标（goal）必须先问下属/)
+  assert.doesNotMatch(text, /选人理由是唯一允许的过程话/)
+  assert.doesNotMatch(text, /用人两步走/)
+})
+
+test('领导模式：侦察结果同样落进全局能力表缓存', async () => {
+  const mounted = mount({ mode: 'leader' })
+  const preExecute = mounted.listener('tools/pre-execute')
+  const postExecute = mounted.listener('tools/post-execute')
+
+  await readRoster(preExecute)
+  await feedRoster(postExecute)
+  await preExecute(exec('subagent', 0, { run_in_background: false }), next)
+  await postExecute(
+    exec('subagent', 0, { run_in_background: false }),
+    { isError: false, content: [{ type: 'text', text: CAPABILITY_TABLE }] },
+    nextPost,
+  )
+
+  assert.ok(existsSync(cacheFile(mounted.storeDir)), '侦察结果要落盘')
+  const written = JSON.parse(readFileSync(cacheFile(mounted.storeDir), 'utf8'))
+  assert.equal(written.models.length, 2)
+})
+
+test('领导模式：有缓存时注入段直接内联能力表', () => {
+  const storeDir = mkdtempSync(join(tmpdir(), 'dsh-outsourcing-expert-test-'))
+  TEMP_DIRS.push(storeDir)
+  seedCache(storeDir, CAPABILITY_TABLE)
+  const { sections } = mount({ mode: 'leader', storeDir })
+  const text = sections[0].text()
+  assert.match(text, /本机缓存的能力表/)
+  assert.match(text, /优先照这张表/)
+  assert.match(text, /deepseek-account\/deepseek-v4-pro/)
+  // 有表之后不再提建表流程，也不搬外包那套「用人两步走」
+  assert.doesNotMatch(text, /用人两步走/)
+  assert.doesNotMatch(text, /外包高手/)
+})
+
 test('白名单内的管理工具与委派工具放行', async () => {
   const { listener } = mount({})
   const preExecute = listener('tools/pre-execute')
