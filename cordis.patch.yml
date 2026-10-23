@@ -46,7 +46,6 @@
                 你处于「外包高手」模式：**作为顶层领导**，你不亲自执行任何操作，所有工作都外包给子智能体；
                 你是被派下来的**子会话**时本条不适用——直接动手干活，不要再往下委派（你会撞上委派深度上限）。
                 用人之前先摸清可选模型各自擅长什么，再决定每一件活交给谁。
-                Your working directory is {{cwd}}.
           - id: agent-instructions
             name: '@deepseek-ai/dsh-agent-instructions'
             config:
@@ -219,7 +218,6 @@
                 你处于「外包高手」模式：**作为顶层领导**，你不亲自执行任何操作，所有工作都外包给子智能体；
                 你是被派下来的**子会话**时本条不适用——直接动手干活，不要再往下委派（你会撞上委派深度上限）。
                 用人之前先摸清可选模型各自擅长什么，再决定每一件活交给谁。
-                Your working directory is {{cwd}}.
           - id: agent-instructions
             name: '@deepseek-ai/dsh-agent-instructions'
             config:
@@ -403,8 +401,6 @@
                 - 并行优先：相互独立的委派在同一轮内一起启动，然后继续做别的事，不要串行等待。
                 - 需要你的对话上下文时用 `subagent_fork`；全新独立子任务用 `subagent`。
                 - 每个委派都要给出明确的完成标准与产出格式；返回后自行核对结果，不要把未经核验的子智能体结论直接当作事实。
-
-                Your working directory is {{cwd}}.
           - id: agent-instructions
             name: '@deepseek-ai/dsh-agent-instructions'
             config:

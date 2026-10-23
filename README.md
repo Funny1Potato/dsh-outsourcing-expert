@@ -117,6 +117,8 @@ dsh plugin --profile <profile> add link:<本目录绝对路径>
 
 Desktop 端走界面最省事（**插件 → 添加插件**，填包名 `dsh-outsourcing-expert`，或 GitHub 名、本地目录绝对路径、`link:<路径>`）；要用命令行管 `desktop` profile，得用桌面端**自带的那份** `dsh`（`where dsh` 里排第一的那个），别的 dsh 安装会被拒（`profile "desktop" is managed exclusively by the Electron application`）。装完后**新建会话**，在 preset 选择里选「外包高手」「外包高手（独具慧眼）」或「领导模式」。
 
+插件面向 **DSH 0.2.x**。persona 文案里只出现宿主注册过的 `{{model}}` / `{{provider}}`：0.2.x 的 prompt 装配是严格解析的，引用未注册的变量会让整轮直接抛 `unknown prompt variable`（1.2.3 及更早的版本在这里留了一句 0.1.x 时代的 `{{cwd}}`，导致三份 preset 全部发不出消息，见 [issue #1](https://github.com/Funny1Potato/dsh-outsourcing-expert/issues/1)）。工作目录不需要自己写——persona 行默认 `includeRuntimeContext: true`，宿主会把「当前工作目录」等作为运行时上下文单独注入。
+
 ## 文件
 
 | 文件 | 作用 |
