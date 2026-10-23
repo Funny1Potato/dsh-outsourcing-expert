@@ -142,7 +142,7 @@ Desktop 端走界面最省事（**插件 → 添加插件**，填包名 `dsh-out
 ## 开发与验证
 
 ```sh
-node --test        # 契约测试：导出形状、提示段字段、拒绝形状、白名单、子 Agent 判据、两个 preset 的规则差异、说话方式文案、能力表缓存的读写与两道门
+node --test        # 契约测试：导出形状、提示段字段、拒绝形状、白名单、子 Agent 判据、两个 preset 的规则差异、说话方式文案、能力表缓存的读写与两道门、persona 文案里的模板变量白名单
 ```
 
 ## 已知限制
@@ -154,3 +154,7 @@ node --test        # 契约测试：导出形状、提示段字段、拒绝形�
 - **选人规则是提示层，不是运行时强制**。宿主的 `tools/pre-execute` **明确排除「改写参数」**（参数此刻已记入日志并展示给用户），插件无法在派发前替领导把 `provider` / `model` 改掉。要真正做到「插件接管选人」，得自己注册一个委派工具并用 `ctx.subagents.start({ agentOptions })` 固定路由——那是另一套实现。
 - **外包高手两个 preset 都是 native 工具模式**，不涉及 PTC。若拿这份花名册去搭 ptc preset，记得把 `run_code` 加进 `allowTools`（否则领导的唯一原生入口也被拦掉）。
 - **运行中的会话不会自动拿到新配置**：改代码或 `cordis.patch.yml` 后需重启 host（或在插件页停用再启用）；已存在的会话保持它创建时的 preset 组合，要**新建会话**才生效。
+
+---
+
+[![](https://img.shields.io/badge/powered_by-dsh-4D6BFE?style=flat-square&logo=deepseek&logoColor=white)](https://github.com/deepseek-ai/deepseek-harness)
