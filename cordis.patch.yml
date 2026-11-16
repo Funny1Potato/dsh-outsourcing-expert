@@ -19,8 +19,9 @@
 #   `outsourcing-expert`，那是最后一次允许动它。`leader` 沿用桌面端 dsh-leader-mode
 #   的 preset id，好让已有会话不失效。）
 #
-# ⚠ 三份花名册必须保持一致：都是官方 standard preset 的原样照抄（含各组件的 isolate
-#   与 !!js 禁用表达式），差别只有最后那行插件的 config。改花名册时三处一起改。
+# ⚠ 三份花名册必须保持一致：以官方 standard preset 为底（保留各组件的 isolate
+#   与 !!js 禁用表达式），按 DSH 0.2.2-rc.2 的导出结构移除了独立 list-agents 行。
+#   业务差别在 persona 与最后那行插件的 config。改花名册时三处一起改。
 #   （没有用 YAML 锚点共享，是因为两边的插件行 config 必须不同，而插件行在同一个数组里。）
 #
 # 为什么以 standard 为底：委派出去的子 Agent 仍要有 read / web_search 等工具才能真正
@@ -118,30 +119,27 @@
             config:
               - id: tool-subagent-control
                 name: '@deepseek-ai/dsh-tool-subagent-control'
-              - id: tool-subagent-list-agents
-                name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
-              # 只有这一个实例开 modelSelectionSettings：它是 list_subagent_models
-              # 的注册者，也是领导能显式指定 provider / model / reasoning_effort 的前提。
+              # DSH 0.2.2-rc.2 主入口已注册 list_agents，不再单独挂载子路径（issue #2）。
+              # spawn 用 modelSelection 开放选模参数，用 modelDiscovery 注册名册。
+              # 每个 scope 只开一次 modelDiscovery，避免 list_subagent_models 重复注册。
               - id: tool-subagent
                 name: '@deepseek-ai/dsh-tool-subagent'
                 config:
                   provider: spawn
                   toolName: subagent
-                  modelSelectionSettings: true
-                  backgroundMode: continuable
+                  modelSelection: true
+                  modelDiscovery: true
               - id: tool-subagent-fork
                 name: '@deepseek-ai/dsh-tool-subagent'
                 config:
                   provider: fork
                   toolName: subagent_fork
-                  backgroundMode: continuable
               - id: tool-subagent-codex
                 name: '@deepseek-ai/dsh-tool-subagent'
                 disabled: true
                 config:
                   provider: codex
                   toolName: subagent_codex
-                  backgroundMode: one-shot
                   maxDepth: provider-managed
               - id: tool-subagent-claude-code
                 name: '@deepseek-ai/dsh-tool-subagent'
@@ -149,7 +147,6 @@
                 config:
                   provider: claude-code
                   toolName: subagent_claude_code
-                  backgroundMode: one-shot
                   maxDepth: provider-managed
               - id: workflow-ptc
                 name: '@deepseek-ai/dsh-workflow-ptc'
@@ -290,28 +287,25 @@
             config:
               - id: tool-subagent-control
                 name: '@deepseek-ai/dsh-tool-subagent-control'
-              - id: tool-subagent-list-agents
-                name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
+              # DSH 0.2.2-rc.2 主入口已注册 list_agents，不再单独挂载子路径（issue #2）。
               - id: tool-subagent
                 name: '@deepseek-ai/dsh-tool-subagent'
                 config:
                   provider: spawn
                   toolName: subagent
-                  modelSelectionSettings: true
-                  backgroundMode: continuable
+                  modelSelection: true
+                  modelDiscovery: true
               - id: tool-subagent-fork
                 name: '@deepseek-ai/dsh-tool-subagent'
                 config:
                   provider: fork
                   toolName: subagent_fork
-                  backgroundMode: continuable
               - id: tool-subagent-codex
                 name: '@deepseek-ai/dsh-tool-subagent'
                 disabled: true
                 config:
                   provider: codex
                   toolName: subagent_codex
-                  backgroundMode: one-shot
                   maxDepth: provider-managed
               - id: tool-subagent-claude-code
                 name: '@deepseek-ai/dsh-tool-subagent'
@@ -319,7 +313,6 @@
                 config:
                   provider: claude-code
                   toolName: subagent_claude_code
-                  backgroundMode: one-shot
                   maxDepth: provider-managed
               - id: workflow-ptc
                 name: '@deepseek-ai/dsh-workflow-ptc'
@@ -473,28 +466,25 @@
             config:
               - id: tool-subagent-control
                 name: '@deepseek-ai/dsh-tool-subagent-control'
-              - id: tool-subagent-list-agents
-                name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
+              # DSH 0.2.2-rc.2 主入口已注册 list_agents，不再单独挂载子路径（issue #2）。
               - id: tool-subagent
                 name: '@deepseek-ai/dsh-tool-subagent'
                 config:
                   provider: spawn
                   toolName: subagent
-                  modelSelectionSettings: true
-                  backgroundMode: continuable
+                  modelSelection: true
+                  modelDiscovery: true
               - id: tool-subagent-fork
                 name: '@deepseek-ai/dsh-tool-subagent'
                 config:
                   provider: fork
                   toolName: subagent_fork
-                  backgroundMode: continuable
               - id: tool-subagent-codex
                 name: '@deepseek-ai/dsh-tool-subagent'
                 disabled: true
                 config:
                   provider: codex
                   toolName: subagent_codex
-                  backgroundMode: one-shot
                   maxDepth: provider-managed
               - id: tool-subagent-claude-code
                 name: '@deepseek-ai/dsh-tool-subagent'
@@ -502,7 +492,6 @@
                 config:
                   provider: claude-code
                   toolName: subagent_claude_code
-                  backgroundMode: one-shot
                   maxDepth: provider-managed
               - id: workflow-ptc
                 name: '@deepseek-ai/dsh-workflow-ptc'

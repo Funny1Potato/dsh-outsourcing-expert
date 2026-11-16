@@ -6,10 +6,11 @@
  * 监听器、`systemPrompt` 段都由 dsh-scope 按会话过滤，别的 preset 的会话完全不受影响。
  * 它自己不判断「我该不该生效」——那是 scope 的职责。
  *
- * 本包声明**两个 preset**（同一个插件模块，靠行配置 `reverseHiring` 区分）：
+ * 本包声明**三个 preset**（同一个插件模块，靠 `reverseHiring` / `mode` 区分）：
  *
  *   - 「外包高手」            → 正常选人（按任务类型 + 难度挑最合适的）
  *   - 「外包高手（独具慧眼）」 → 故意反着选（挑最不适合这个任务的）
+ *   - 「领导模式」            → 自己也能干活，共用模型能力表
  *
  * 一条纪律：领导不亲自干活，只能提问 / 拆解 / 定目标 / 委派。
  * 用人两步走：第一轮派一个子智能体**联网调研**「可选模型各自擅长什么」，拿到能力表
@@ -23,7 +24,8 @@
  * 表**只在空的时候写**，永不自动覆盖：想换新表就删文件或跑 `/outsourcing-models-clear`
  * （要连当前会话一起重来，用 `/outsourcing-models-init`）。
  *
- * 与宿主 dsh 0.2.0-rc.2 的契约，逐条按源码核过：
+ * 当前预设以 dsh 0.2.2-rc.3 为验证基准：委派异步返回名称，最终回答从 subagent/end 接收。
+ * 旧版暴露 run_in_background 的工具仍按其 schema 使用前台协议。基础插件契约：
  *
  *   - 插件模块必须具名导出 `name` / `inject` / `apply(ctx, config)`。配置由 apply
  *     的第二参数传入——不存在 `config` 服务，把它写进 `inject` 会让插件的 fiber
@@ -67,7 +69,7 @@ export const inject = ['tools', 'systemPrompt']
  * 判据是「这个动作能不能让别人替你做」：
  *   - 沟通 / 规划 / 目标：只能由领导对用户和自身会话做，子 Agent 替代不了；
  *   - 用人：委派本身（`subagent` / `subagent_fork`）与照看下属
- *     （`list_subagent_models` / `list_agents` / `send_message` / `interrupt_agent`）；
+ *     （`list_subagent_models` / `list_agents` / `send_message` / `interrupt_agent` / `wait_agent`）；
  *   - 其余一切（读写文件、跑命令、搜索、上网、workflow、skill、自省……）都算「干活」，
  *     一律拦下，让领导改用委派。
  *
@@ -91,6 +93,7 @@ const DEFAULT_ALLOW = [
   'list_agents',
   'send_message',
   'interrupt_agent',
+  'wait_agent',
 ]
 
 /** 四档难度，纪律段共用同一套说法。 */
@@ -187,19 +190,28 @@ function selectionReason(reverse) {
 function delegationNaming(available) {
   const has = (tool) => available === undefined || available.has(tool)
   const roster = has('list_subagent_models')
+  const wait = has('wait_agent')
   if (has('subagent')) {
     return {
       main: 'subagent',
       roster,
+      wait,
       hint: has('subagent_fork')
         ? '需要你当前对话上下文时用 `subagent_fork`，全新独立子任务用 `subagent`。'
         : '',
     }
   }
   if (has('subagent_fork')) {
-    return { main: 'subagent_fork', roster, hint: '本 preset 只有 `subagent_fork`：独立子任务也用它。' }
+    return { main: 'subagent_fork', roster, wait, hint: '本 preset 只有 `subagent_fork`：独立子任务也用它。' }
   }
-  return { main: 'subagent', roster, hint: '' }
+  return { main: undefined, roster, wait, hint: '' }
+}
+
+/** 0.2.2-rc.3 的委派只返回启动回执，结果通过完成通知送达。 */
+function waitingAdvice(naming) {
+  return naming.wait
+    ? '需要等待时可调用 `wait_agent`，或结束当前轮，让完成通知唤醒你；不要睡眠或轮询。'
+    : '结束当前轮，让完成通知唤醒你；不要睡眠或轮询。'
 }
 
 /** 读出这次委派参数里的一个非空字符串字段。 */
@@ -631,23 +643,31 @@ function hiringSteps(reverse, escalateOnFailure, hasCache, naming) {
   const fallback = hasCache
     ? '确实需要表外的模型时，省略 `provider` / `model` 交给默认路线，并说明原因；'
     : '能力表为空（侦察失败）时才退回上面那套名称启发式；'
+  const parallel = naming.asynchronous
+    ? `**并行优先**：\`${naming.main}\` 立即返回子智能体名称，启动回执不是任务结果。
+   相互独立的活可以一起派出去；依赖某个结果的活必须等完成通知之后再派。
+   ${waitingAdvice(naming)}${naming.hint}`
+    : `**并行优先**：\`${naming.main}\` 默认后台运行（\`run_in_background\` 默认 true），结果落定时
+   你会收到通知——相互独立的活一次派出去、别串行干等；只有下一步确实依赖某个结果时才传
+   \`run_in_background: false\`。**有前台委派在飞的时候新的委派会被拦下**，那说明你本该用
+   后台。${naming.hint}`
+  const route = naming.modelSelection === false
+    ? `**本工具未开放子级选模**：用 \`${naming.main}\` 的默认路线，省略 \`provider\`、\`model\`、\`reasoning_effort\`，\`description\` 写「默认路线：<任务>」。`
+    : `**选定后要显式传给 \`${naming.main}\`**（\`provider\` + \`model\`，必要时带 \`reasoning_effort\`），
+   并按上面的格式把它写进 \`description\`——只在心里想、不写进调用参数，等于没选：
+   模型会走默认路线，卡片上也看不到。`
   return `1. **判难度与类型**：先把这项子任务归到「${DIFFICULTY_BANDS.join(' / ')}」四档之一，
    再判它主要属于哪类活——写/改代码、联网调研、读文档与总结、数据分析、图像/视频/语音理解、
    纯问答（拿不准就取最主要的那类）。
 2. **按能力表选人**：${selectionRule(reverse)}
    ${scope}
    ${fallback}
-   **选定后要显式传给 \`${naming.main}\`**（\`provider\` + \`model\`，必要时带 \`reasoning_effort\`），
-   并按上面的格式把它写进 \`description\`——只在心里想、不写进调用参数，等于没选：
-   模型会走默认路线，卡片上也看不到。
+   ${route}
 ${escalateOnFailure
     ? '3. **失败升级**：某个委派失败或明显没做好时，允许**换更高一档的模型重试一次**；\n'
       + '   第二次仍失败就停下来向用户汇报，不要无限重试。\n'
       + '4. '
-    : '3. '}**并行优先**：\`${naming.main}\` 默认后台运行（\`run_in_background\` 默认 true），结果落定时
-   你会收到通知——相互独立的活一次派出去、别串行干等；只有下一步确实依赖某个结果时才传
-   \`run_in_background: false\`。**有前台委派在飞的时候新的委派会被拦下**，那说明你本该用
-   后台。${naming.hint}`
+    : '3. '}${parallel}`
 }
 
 /** 还没有缓存时的「用人」部分：先侦察，再派活。 */
@@ -665,6 +685,16 @@ function reconPlan(reverse, escalateOnFailure, naming) {
       + '   \`reasoning_effort\` 全部省略交给默认路线。'
     : '1. **清单从哪来**：本 preset 没有 \`list_subagent_models\`，就用你已知的模型名当清单；'
       + '实在\n   列不出来，就把 \`provider\` / \`model\` / \`reasoning_effort\` 全省略、交给默认路线。'
+  const gateResult = naming.asynchronous
+    ? `2. **侦察完成前不派业务任务**：启动回执只说明子智能体已启动，等完成通知里的能力表。
+   ${waitingAdvice(naming)}`
+    : '2. **侦察必须前台**：传 `run_in_background: false` 当场等结果，而且**那一轮只发这一次\n   委派**——不要在同一轮里顺手把干活的活也派出去。'
+  const waitResult = naming.asynchronous
+    ? '   - **只发这一次侦察委派，等完成通知后再选人派活**；不要把启动回执当作能力表；'
+    : '   - **这一轮必须传 `run_in_background: false`**——你的下一步（决定派谁）依赖它的结果，\n     要当场等它返回；'
+  const route = naming.modelSelection === false
+    ? '该工具未开放子级选模，省略 `provider`、`model`、`reasoning_effort`，交给默认路线'
+    : '显式传入你随机挑中的那个 `provider` / `model`'
   return `## 用人两步走：先摸清人选，再决定派谁
 
 ${DELEGATION_FORMAT}
@@ -676,15 +706,13 @@ ${DELEGATION_FORMAT}
 ⚠ **两道顺序是硬的，做不到会被当场拦下**：
 
 ${gateRoster}
-2. **侦察必须前台**：传 \`run_in_background: false\` 当场等结果，而且**那一轮只发这一次
-   委派**——不要在同一轮里顺手把干活的活也派出去。
+${gateResult}
 
 ${stepRoster}
 2. **随机挑一个当侦察兵**：从这份清单里**随机**选一个模型，不要挑「看起来最强」的。
    这一轮不按难度选人——它的任务是调研，不是干正事。
-3. **派它去联网调研**（用 \`${naming.main}\`，并显式传入你随机挑中的那个 \`provider\` / \`model\`）：
-   - **这一轮必须传 \`run_in_background: false\`**——你的下一步（决定派谁）依赖它的结果，
-     要当场等它返回；
+3. **派它去联网调研**（用 \`${naming.main}\`，${route}）：
+${waitResult}
    - 把**完整的可选模型清单**贴进委派提示——它看不到你手上的这份清单；
    - 告诉它**自己用 \`web_search\` 查、不要再往下委派**——侦察兵已经到了委派深度上限
      （上限随 dsh 客户端配置），再派一个子智能体会被系统拒绝，它就交不回能力表；
@@ -754,12 +782,15 @@ function leaderTable(cache, naming) {
         + '   的 provider 列表，再按 provider 逐个查它公布的模型），把**完整清单**抄下来（provider 名\n'
         + '   照抄，别换成模型的真实厂商）；\n'
       : '1. 本 preset 没有 \`list_subagent_models\`，用你已知的模型名当清单；\n'
+    const wait = naming.asynchronous
+      ? `立即返回子智能体名称，等完成通知后再使用能力表；${waitingAdvice(naming)}`
+      : '`run_in_background: false` 当场等结果，那一轮只发这一次委派'
     return `## 能力表（本机还没有）
 
 本机还没有能力表缓存，第一次委派前先建一次（建好自动缓存到本机，之后所有会话直接复用）：
 
-${roster}2. 用 \`${naming.main}\` 派一个侦察兵去联网调研（\`run_in_background: false\` 当场等结果，那一轮只发
-   这一次委派）：把清单贴给它，让它自己用 \`web_search\` 查每个模型「擅长什么、适合哪类任务、
+${roster}2. 用 \`${naming.main}\` 派一个侦察兵去联网调研（${wait}）：把清单贴给它，
+   让它自己用 \`web_search\` 查每个模型「擅长什么、适合哪类任务、
    评测/口碑如何」并附来源链接，**不要再往下委派**（会撞委派深度上限）；
 3. 侦察结果会自动缓存成能力表。建好之前，选模仍按你原有的发现 / 判档 / 联网核实流程走。`
   }
@@ -783,6 +814,10 @@ ${renderCache(cache)}`
  * @returns {string}
  */
 function discipline(reverse, escalateOnFailure, allowList, cache, naming, leaderMode = false) {
+  if (naming.main === undefined) {
+    return '# 委派工具不可用\n\n当前会话没有可用的委派工具，无法启动模型调研或外包任务。'
+      + '请检查 preset 的委派插件与后端是否启用；不要调用未注册的工具，也不要声称任务已委派。'
+  }
   // 领导模式只加能力表，纪律留在它自己的 persona 里。
   if (leaderMode) return leaderTable(cache, naming)
   return [
@@ -873,6 +908,9 @@ export function apply(ctx, config = {}) {
   const rosters = new Map()
   /** 待缓存的侦察：发起方 → 那条委派的模型路线（跑完就写进缓存）。 */
   const reconPending = new Map()
+  /** 异步侦察按生命周期 runId 配对，启动回执不能当成最终结果。 */
+  const reconChildren = new Map()
+  const reconInFlight = new Set()
   /** 发起方 → 已经试过几次「结果不像能力表」（配合 MAX_RECON_TRIES 用）。 */
   const reconAttempts = new Map()
   /**
@@ -886,9 +924,9 @@ export function apply(ctx, config = {}) {
    */
   const pendingClaims = new Map()
 
-  const rememberDelegation = (agentId, exec) => {
+  const rememberDelegation = (agentId, exec, recon = false) => {
     const queue = pendingClaims.get(agentId) ?? []
-    queue.push({ route: shortRoute(exec), task: delegationTask(exec) })
+    queue.push({ route: shortRoute(exec), task: delegationTask(exec), recon })
     // 只用于配对，压到 4 条就够，异常路径下也不会无限长。
     pendingClaims.set(agentId, queue.slice(-4))
   }
@@ -902,11 +940,12 @@ export function apply(ctx, config = {}) {
 
   /** 本会话真实存在的工具名集合；拿不到就返回 undefined（此时提示不做过滤，宁可多列）。 */
   const availableTools = (agent) => {
+    if (agent === undefined) return undefined
     try {
       const names = ctx.tools.schemas(agent)
         .map(schema => schema?.name)
         .filter(name => typeof name === 'string' && name !== '')
-      return names.length > 0 ? new Set(names) : undefined
+      return new Set(names)
     } catch {
       return undefined
     }
@@ -973,6 +1012,24 @@ export function apply(ctx, config = {}) {
     }
   }
 
+  /** 旧版工具结果和新版 subagent/end 共用缓存体检与重试预算。 */
+  const finishRecon = (agentId, route, result) => {
+    if (!reconPending.has(agentId) || result?.isError === true) return
+    if (persistRecon(agentId, route, result)) {
+      reconPending.delete(agentId)
+      reconAttempts.delete(agentId)
+      rosters.delete(agentId)
+    } else {
+      const tries = (reconAttempts.get(agentId) ?? 0) + 1
+      if (tries >= MAX_RECON_TRIES) {
+        reconPending.delete(agentId)
+        reconAttempts.delete(agentId)
+        rosters.delete(agentId)
+        ctx.logger?.debug?.(`outsourcing-expert: 侦察连续 ${tries} 次不像能力表，本会话放弃缓存`)
+      } else reconAttempts.set(agentId, tries)
+    }
+  }
+
   ctx.on('agent/pre-step', ({ agent }, next) => {
     if (agent !== undefined) foregroundInFlight.delete(agent.id)
     return next()
@@ -985,13 +1042,15 @@ export function apply(ctx, config = {}) {
     const childId = typeof info?.id === 'string' ? info.id : undefined
     if (childId === undefined) return
     const child = ctx.get('sessions')?.get(childId) ?? ctx.get('agents')?.get(childId)?.session
-    if (child === undefined) return
-    const parentId = child.header?.parentSession
+    const parentId = info.parentSessionId ?? child?.header?.parentSession
     const claim = typeof parentId === 'string' ? claimDelegation(parentId) : undefined
     if (claim === undefined) return
+    if (claim.recon) {
+      reconChildren.set(info.runId ?? childId, { parentId, route: claim.route })
+    }
 
     const titles = ctx.get('sessionTitle')
-    if (titles === undefined) return
+    if (titles === undefined || child === undefined) return
     // 把「这次用了哪个模型 + 任务」写成子会话标题：`rename` 会把它**钉住**（自动起名与
     // 兜底标题都不会再覆盖），于是子智能体头部/切换器里一眼就能看到派给谁。
     // 尽力而为：失败只记 debug，绝不影响委派本身。
@@ -1000,6 +1059,19 @@ export function apply(ctx, config = {}) {
     } catch (error) {
       ctx.logger?.debug?.(`outsourcing-expert: 子会话 ${childId} 命名失败：${String(error)}`)
     }
+  }, { global: true })
+
+  ctx.on('subagent/end', (info) => {
+    const runId = info?.runId ?? info?.id
+    const recon = reconChildren.get(runId)
+    if (recon === undefined) return
+    // 全局与 scope 派发可能重叠；认领后立即删除，防止重复写盘或重复消费重试预算。
+    reconChildren.delete(runId)
+    reconInFlight.delete(recon.parentId)
+    finishRecon(recon.parentId, recon.route, {
+      isError: info.stopReason !== 'completed',
+      content: info.lastAssistantMessage,
+    })
   }, { global: true })
 
   // 下属（会话头标明是子 Agent）照常干活；宿主内部不带 agent 的调用也放行——那种调用
@@ -1018,13 +1090,21 @@ export function apply(ctx, config = {}) {
     // 就会把自己的侦察兵一起拦掉。
     if (leader && toolName === ROSTER_TOOL) rosterRead.add(agent.id)
 
-    if (leader && DELEGATION_TOOLS.has(toolName) && supportsBackgroundFlag(agent, toolName)) {
+    if (leader && DELEGATION_TOOLS.has(toolName)) {
       const id = agent.id
+      const backgroundFlag = supportsBackgroundFlag(agent, toolName)
       // 这一条之前是否必须先做侦察：缓存开着且还没有表时要做；缓存整个关掉时按老行为
       // 「每个会话各自侦察一次」也要做（否则关掉缓存就等于把两道门也一起关了）。
       const needsRecon = cacheEnabled ? readCache() === undefined : true
       const first = !delegatedOnce.has(id)
 
+      if (!backgroundFlag && reconInFlight.has(id) && needsRecon) {
+        return {
+          kind: 'deny',
+          reason: `【${modeLabel}】侦察子智能体尚未完成，启动回执不是能力表。先等完成通知，再派业务任务。`
+            + waitingAdvice({ wait: hasTool(agent, 'wait_agent') }),
+        }
+      }
       if (needsRecon && first && !rosterRead.has(id) && hasTool(agent, ROSTER_TOOL)) {
         return {
           kind: 'deny',
@@ -1041,7 +1121,7 @@ export function apply(ctx, config = {}) {
         }
       }
       const foreground = exec?.arguments?.run_in_background === false
-      if (needsRecon && first && !foreground) {
+      if (backgroundFlag && needsRecon && first && !foreground) {
         return {
           kind: 'deny',
           reason: `【${modeLabel}】第一轮侦查必须先做、而且必须当场等结果：这次委派请传 `
@@ -1050,11 +1130,13 @@ export function apply(ctx, config = {}) {
         }
       }
       delegatedOnce.add(id)
-      if (foreground) foregroundInFlight.add(id)
+      if (backgroundFlag && foreground) foregroundInFlight.add(id)
       // 空表时的第一条委派就是侦察：记下它的路线，等结果落定后写进缓存。
       if (cacheEnabled && needsRecon && first) reconPending.set(id, delegationRoute(exec))
+      const asyncRecon = !backgroundFlag && needsRecon && (first || reconPending.has(id))
+      if (asyncRecon) reconInFlight.add(id)
       // 记下这次委派的「模型 + 任务」：等 `subagent/start` 里按发起方认领并写成子会话标题。
-      rememberDelegation(id, exec)
+      rememberDelegation(id, exec, asyncRecon)
       return next()
     }
 
@@ -1063,11 +1145,13 @@ export function apply(ctx, config = {}) {
     // 领导模式自己是执行者：干活工具不拦（外包高手才需要把领导锁死成纯委派）。
     if (leaderMode) return next()
 
+    const naming = delegationNaming(availableTools(agent))
     return {
       kind: 'deny',
       reason: `【外包高手】你不亲自调用「${toolName}」。你只负责提问、拆解、定目标与委派：`
-        + `请改用 \`${delegationNaming(availableTools(agent)).main}\` 把这件事外包出去。`
-        + delegationNaming(availableTools(agent)).hint,
+        + (naming.main === undefined
+          ? '当前会话没有可用的委派工具，请检查 preset 的委派插件与后端是否启用。'
+          : `请改用 \`${naming.main}\` 把这件事外包出去。${naming.hint}`),
     }
   })
 
@@ -1087,32 +1171,9 @@ export function apply(ctx, config = {}) {
       rememberRoster(agent.id, resultText(result))
     }
 
-    // 侦察结果缓存：只有「空表时那条被标成侦察的委派」才会命中，而且要求它成功。
-    // 关键：**只有真的写进缓存才丢标记**——第一条结果不像能力表（侦察兵翻车、被深度上限
-    // 拒了…）时留着它，后面那次合格的能力表才不会被漏掉。实测踩过：16:13 清空后第一条
-    // 侦察返回「subagent depth 2 exceeds maxDepth 1」，第二次才交出真表，却因为标记已被
-    // 消费而一张都没存上。连续 MAX_RECON_TRIES 次都不像表，就放弃本会话，防止标记无限挂着。
-    // 注意只有**前台**委派的结果里才有子智能体的产出（后台那条只带回执），而侦察按纪律
-    // 本来就是前台，所以这里不会漏。
-    if (agent !== undefined && delegation && !isSubagent(agent) && reconPending.has(agent.id)) {
-      if (result?.isError !== true) {
-        const route = reconPending.get(agent.id)
-        if (persistRecon(agent.id, route, result)) {
-          reconPending.delete(agent.id)
-          reconAttempts.delete(agent.id)
-          rosters.delete(agent.id)
-        } else {
-          const tries = (reconAttempts.get(agent.id) ?? 0) + 1
-          if (tries >= MAX_RECON_TRIES) {
-            reconPending.delete(agent.id)
-            reconAttempts.delete(agent.id)
-            rosters.delete(agent.id)
-            ctx.logger?.debug?.(`outsourcing-expert: 侦察连续 ${tries} 次不像能力表，本会话放弃缓存`)
-          } else {
-            reconAttempts.set(agent.id, tries)
-          }
-        }
-      }
+    // 旧版前台工具的最终回答在工具结果里；新版启动回执不消费侦察标记，等 subagent/end。
+    if (agent !== undefined && delegation && !isSubagent(agent) && supportsBackgroundFlag(agent, exec.name)) {
+      finishRecon(agent.id, reconPending.get(agent.id), result)
     }
 
     const downstream = await next()
@@ -1120,7 +1181,15 @@ export function apply(ctx, config = {}) {
     if (result?.isError === true) {
       // 这条委派没跑起来（参数不合法、被别的策略拒了…）：把它的待认领项丢掉，否则下一件
       // 子会话会张冠李戴（实测踩过：失败的前台委派把任务安到了别的子会话头上）。
-      if (agent !== undefined && !isSubagent(agent)) claimDelegation(agent.id)
+      if (agent !== undefined && !isSubagent(agent)) {
+        claimDelegation(agent.id)
+        if (!supportsBackgroundFlag(agent, exec.name)
+          && ![...reconChildren.values()].some(recon => recon.parentId === agent.id)) {
+          reconInFlight.delete(agent.id)
+          reconPending.delete(agent.id)
+          delegatedOnce.delete(agent.id)
+        }
+      }
       return downstream
     }
     if (downstream.kind === 'block' || Object.hasOwn(downstream, 'value')) return downstream
@@ -1149,6 +1218,12 @@ export function apply(ctx, config = {}) {
       // 直接去调它，宿主回 `ToolNotFoundError: unknown tool "subagent"`（真机实测）。
       const available = availableTools(agent)
       const naming = delegationNaming(available)
+      naming.asynchronous = available !== undefined && naming.main !== undefined
+        && !supportsBackgroundFlag(agent, naming.main)
+      const parameters = naming.asynchronous
+        ? ctx.tools.schemas(agent).find(schema => schema.name === naming.main)?.parameters?.properties
+        : undefined
+      naming.modelSelection = !naming.asynchronous || (parameters?.provider !== undefined && parameters?.model !== undefined)
       const listed = available === undefined
         ? [...allowTools]
         : [...allowTools].filter(tool => available.has(tool))
@@ -1217,11 +1292,18 @@ export function apply(ctx, config = {}) {
           delegatedOnce.delete(id)
           rosterRead.delete(id)
           reconPending.delete(id)
+          reconInFlight.delete(id)
+          reconAttempts.delete(id)
+          rosters.delete(id)
+          pendingClaims.delete(id)
+          for (const [runId, recon] of reconChildren) {
+            if (recon.parentId === id) reconChildren.delete(runId)
+          }
         }
         return {
           kind: 'success',
           text: '已清空能力表缓存，本会话也重新初始化：下一条委派之前必须先调 '
-            + 'list_subagent_models 拿名册，再派一个前台侦察兵；侦察结果会自动写回缓存。',
+            + 'list_subagent_models 拿名册，再派侦察兵并等最终结果；侦察结果会自动写回缓存。',
         }
       },
     })

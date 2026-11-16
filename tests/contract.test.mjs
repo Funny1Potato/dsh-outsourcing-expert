@@ -174,11 +174,11 @@ test('模块导出符合 Cordis 插件契约', () => {
   assert.ok(!inject.includes('config'), "inject 不能包含 'config'：配置由 apply 的第二参数传入")
 })
 
-test('只注册四个监听器、一个提示段与一个命令，不注册任何工具', () => {
+test('注册委派生命周期监听器、一个提示段与缓存命令，不注册任何工具', () => {
   const { listeners, sections, tools, commands } = mount({})
   assert.deepEqual(
     listeners.map(entry => entry.eventName).sort(),
-    ['agent/pre-step', 'subagent/start', 'tools/post-execute', 'tools/pre-execute'],
+    ['agent/pre-step', 'subagent/end', 'subagent/start', 'tools/post-execute', 'tools/pre-execute'],
   )
   assert.equal(sections.length, 1)
   assert.equal(tools.length, 0, '不应注册工具')
@@ -383,7 +383,7 @@ test('白名单内的管理工具与委派工具放行', async () => {
   for (const toolName of [
     'ask_user_question', 'todo_write', 'exit_plan_mode',
     'get_goal', 'create_goal', 'update_goal',
-    'list_subagent_models', 'list_agents', 'send_message', 'interrupt_agent',
+    'list_subagent_models', 'list_agents', 'send_message', 'interrupt_agent', 'wait_agent',
   ]) {
     assert.equal(await preExecute(exec(toolName), next), ALLOWED, `${toolName} 应放行`)
   }
@@ -630,7 +630,113 @@ test('顺序纪律的兜底与边界', async () => {
 
   // schema 没暴露 run_in_background 的 preset：不强制前台（否则会锁死）。
   const loose = mount({}, { exposeBackgroundFlag: false })
+  await readRoster(loose.listener('tools/pre-execute'))
   assert.equal(await loose.listener('tools/pre-execute')(exec('subagent', 0, {}), next), ALLOWED)
+})
+
+for (const config of [{}, { reverseHiring: true }, { mode: 'leader' }]) {
+  test(`0.2.2-rc.3 异步侦察：启动回执不落盘，完成通知才建表（${JSON.stringify(config)}）`, async () => {
+    const mounted = mount(config, {
+      exposeBackgroundFlag: false,
+      toolNames: ['subagent', 'subagent_fork', 'list_subagent_models', 'wait_agent'],
+    })
+    const pre = mounted.listener('tools/pre-execute')
+    const post = mounted.listener('tools/post-execute')
+    const recon = exec('subagent', 0, { description: 'deepseek-account/deepseek-v4-pro：调研', provider: 'deepseek-account', model: 'deepseek-v4-pro' })
+    const prompt = mounted.sections[0].text({ agent: recon.agent })
+    assert.ok(!prompt.includes('run_in_background'), '异步工具不能再要求传已移除的参数')
+    assert.match(prompt, /完成通知/)
+    assert.match(prompt, /wait_agent/)
+    assert.equal((await pre(recon, next)).kind, 'deny', '仍然先查名册')
+    await readRoster(pre)
+    await feedRoster(post)
+    assert.equal(await pre(recon, next), ALLOWED)
+    const info = { id: 'scout-child', parentSessionId: recon.agent.id, runId: 'recon-run' }
+    mounted.listener('subagent/start')(info)
+    await post(recon, { isError: false, value: { kind: 'activation', name: 'scout' }, content: [{ type: 'text', text: 'started subagent scout' }] }, nextPost)
+    assert.ok(!existsSync(cacheFile(mounted.storeDir)), '启动回执不能写成能力表')
+    assert.equal((await pre(exec('subagent_fork'), next)).kind, 'deny', '侦察完成前不能派业务任务')
+    await mounted.listener('agent/pre-step')({ agent: recon.agent }, next)
+    assert.equal((await pre(exec('subagent_fork'), next)).kind, 'deny', '下一步也不能把异步侦察当成已结束')
+    assert.equal(await pre(exec('wait_agent'), next), ALLOWED, '领导必须能等待结果')
+    mounted.listener('subagent/end')({ ...info, stopReason: 'completed', lastAssistantMessage: [{ type: 'text', text: CAPABILITY_TABLE }] })
+    assert.ok(existsSync(cacheFile(mounted.storeDir)), '真实完成结果应落盘')
+    assert.equal(await pre(exec('subagent_fork'), next), ALLOWED, '建表后恢复正常并行委派')
+    assert.match(mounted.sections[0].text({ agent: recon.agent }), /本机缓存的能力表/)
+  })
+}
+
+test('异步侦察启动失败后可以重试，不会永久锁住领导', async () => {
+  const mounted = mount({}, { exposeBackgroundFlag: false })
+  const pre = mounted.listener('tools/pre-execute')
+  const post = mounted.listener('tools/post-execute')
+  await readRoster(pre)
+  const request = exec('subagent')
+  assert.equal(await pre(request, next), ALLOWED)
+  await post(request, { isError: true, content: [] }, nextPost)
+  assert.equal(await pre(request, next), ALLOWED)
+  const info = { id: 'retry-child', parentSessionId: request.agent.id, runId: 'retry-run' }
+  mounted.listener('subagent/start')(info)
+  mounted.listener('subagent/end')({ ...info, stopReason: 'completed', lastAssistantMessage: [{ type: 'text', text: CAPABILITY_TABLE }] })
+  assert.ok(existsSync(cacheFile(mounted.storeDir)))
+})
+
+test('异步完成按 runId 归属过滤、失败结果不缓存，后续侦察仍可成功', async () => {
+  const mounted = mount({}, { exposeBackgroundFlag: false })
+  const pre = mounted.listener('tools/pre-execute')
+  await readRoster(pre)
+  await pre(exec('subagent'), next)
+  const info = { id: 'scout', parentSessionId: 'agent-0', runId: 'first-run' }
+  mounted.listener('subagent/start')(info)
+  const end = mounted.listener('subagent/end')
+  const table = { stopReason: 'completed', lastAssistantMessage: [{ type: 'text', text: CAPABILITY_TABLE }] }
+  end({ ...info, ...table, runId: 'foreign-run' })
+  assert.ok(!existsSync(cacheFile(mounted.storeDir)), '其他 run 的结果不能认领')
+  assert.equal((await pre(exec('subagent'), next)).kind, 'deny')
+  end({ ...info, ...table, stopReason: 'error' })
+  assert.ok(!existsSync(cacheFile(mounted.storeDir)), '失败时的半截输出不能缓存')
+  assert.equal(await pre(exec('subagent'), next), ALLOWED)
+  const retry = { ...info, runId: 'second-run' }
+  mounted.listener('subagent/start')(retry)
+  end({ ...info, ...table })
+  assert.ok(!existsSync(cacheFile(mounted.storeDir)), '重复旧通知不能抢占新侦察')
+  end({ ...retry, ...table })
+  assert.ok(existsSync(cacheFile(mounted.storeDir)))
+})
+
+test('初始化会使尚未完成的异步侦察失效，旧结果不能填回新缓存', async () => {
+  const mounted = mount({}, { exposeBackgroundFlag: false })
+  const pre = mounted.listener('tools/pre-execute')
+  await readRoster(pre)
+  await pre(exec('subagent'), next)
+  const info = { id: 'old-scout', parentSessionId: 'agent-0', runId: 'old-run' }
+  mounted.listener('subagent/start')(info)
+  mounted.command('outsourcing-models-init').handler({ agent: exec('subagent').agent })
+  mounted.listener('subagent/end')({ ...info, stopReason: 'completed', lastAssistantMessage: [{ type: 'text', text: CAPABILITY_TABLE }] })
+  assert.ok(!existsSync(cacheFile(mounted.storeDir)))
+  assert.equal((await pre(exec('subagent'), next)).kind, 'deny', '重新初始化后需要重查名册')
+  await readRoster(pre)
+  assert.equal(await pre(exec('subagent'), next), ALLOWED)
+})
+
+test('没有委派工具时不捏造 subagent；仅有 fork 时只提示实际工具', async () => {
+  for (const toolNames of [[], ['wait_agent']]) {
+    const mounted = mount({}, { toolNames })
+    const agent = exec('read').agent
+    const prompt = mounted.sections[0].text({ agent })
+    assert.match(prompt, /委派工具不可用/)
+    assert.ok(!prompt.includes('`subagent`'))
+    const denial = await mounted.listener('tools/pre-execute')(exec('read'), next)
+    assert.match(denial.reason, /没有可用的委派工具/)
+    assert.ok(!denial.reason.includes('`subagent`'))
+  }
+  const fork = mount({}, { exposeBackgroundFlag: false, toolNames: ['subagent_fork', 'wait_agent'] })
+  const prompt = fork.sections[0].text({ agent: exec('read').agent })
+  assert.match(prompt, /`subagent_fork`/)
+  assert.ok(!prompt.includes('`subagent`'))
+  assert.ok(!prompt.includes('run_in_background'))
+  assert.match(prompt, /该工具未开放子级选模/)
+  assert.doesNotMatch(prompt, /选定后要显式传给/)
 })
 
 test('子 Agent 不受拦截（含孙子 Agent 与 fork 子会话）', async () => {
